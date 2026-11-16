@@ -8,14 +8,15 @@ Aufrufe:
   python buddy.py act <name>      yawn, stretch, yoyo, book, water, bubble, whistle
   python buddy.py party <sek>     Feier testen (unter 60 nicken, bis 300 Konfetti, darueber Feuerwerk)
   python buddy.py long <min>      lange Arbeit testen (ab 5 Schweiss, 10 Kaffee, 15 Dampf)
-  python buddy.py wifi            WLAN-Zugang ueber USB ins Geraet schreiben
+  python buddy.py wifi            WLAN-Zugang ins Geraet schreiben (USB oder bestehendes WLAN)
   python buddy.py find            Geraet suchen, Verbindung pruefen
   python buddy.py bild <datei> [s] Bild als Polaroid zeigen, optional s Sekunden (braucht pillow)
   python buddy.py update          Buddy sofort nach neuer Firmware suchen lassen
   python buddy.py install         Hooks in Claude Code eintragen (~/.claude/settings.json)
   python buddy.py uninstall       Hooks wieder entfernen
 
-Verbindung: zuerst USB (Espressif-Port), sonst WLAN (IP aus config.json).
+Verbindung: zuerst USB (Espressif-Port), sonst WLAN (IP aus config.json, sonst claude-buddy.local).
+Alle Befehle gehen auch per WLAN. Mit --wlan wird USB uebersprungen (zum Testen).
 """
 import json
 import os
@@ -73,14 +74,50 @@ def find_ports():
         return []
 
 
+FORCE_WLAN = "--wlan" in sys.argv  # zum Testen: USB auslassen
+if FORCE_WLAN:
+    sys.argv.remove("--wlan")
+
+
+def http(path, data=None, timeout=0.6):
+    """Ruft http://<buddy>/<path> auf (IP aus config.json, sonst ueber claude-buddy.local).
+    Gibt die Antwort als Text zurueck oder None."""
+    import urllib.request
+    cfg = load_cfg()
+    host = cfg.get("host")
+    hosts = [host] if host else []
+    for attempt in range(2):
+        for h in hosts:
+            try:
+                req = urllib.request.Request("http://%s%s" % (h, path), data=data,
+                                             headers={"Content-Type": "text/plain"} if data else {})
+                txt = urllib.request.urlopen(req, timeout=timeout).read().decode("ascii", "replace")
+                if h != cfg.get("host"):
+                    cfg["host"] = h
+                    save_cfg(cfg)
+                return txt
+            except Exception:
+                pass
+        if attempt == 0:  # IP hat sich evtl. geaendert (DHCP): ueber den mDNS-Namen neu suchen
+            try:
+                import socket
+                ip = socket.gethostbyname("claude-buddy.local")
+            except Exception:
+                return None
+            hosts = [ip] if ip and ip != host else []
+            if not hosts:
+                return None
+    return None
+
+
 def send_line(line):
     """Schickt eine Zeile; True wenn es geklappt hat."""
     cfg = load_cfg()
     data = (line + "\n").encode("ascii", "replace")
     ports = []
-    if cfg.get("port"):
+    if cfg.get("port") and not FORCE_WLAN:
         ports.append(cfg["port"])
-    for attempt in range(2):
+    for attempt in range(0 if FORCE_WLAN else 2):
         for p in ports:
             for _ in range(3):  # Port kann kurz von einem anderen Hook belegt sein
                 try:
@@ -102,30 +139,13 @@ def send_line(line):
             if not ports:
                 break
     # WLAN
-    host = cfg.get("host")
-    if line.startswith("S "):
-        import urllib.parse, urllib.request
+    import urllib.parse
+    if line.startswith("S "):  # Zustand ueber /s (kennt auch aeltere Firmware)
         f = line[2:].split("|")
         f += [""] * (5 - len(f))
         q = urllib.parse.urlencode({"st": f[0], "d": f[1], "t": f[2], "sid": f[3], "p": f[4]})
-        if host:
-            try:
-                urllib.request.urlopen("http://%s/s?%s" % (host, q), timeout=0.6).read()
-                return True
-            except Exception:
-                pass
-        # IP hat sich evtl. geaendert (DHCP): ueber den mDNS-Namen neu suchen
-        try:
-            import socket
-            ip = socket.gethostbyname("claude-buddy.local")
-            if ip and ip != host:
-                urllib.request.urlopen("http://%s/s?%s" % (ip, q), timeout=0.6).read()
-                cfg["host"] = ip
-                save_cfg(cfg)
-                return True
-        except Exception:
-            pass
-    return False
+        return http("/s?" + q) is not None
+    return http("/cmd?" + urllib.parse.urlencode({"l": line}), timeout=2) is not None  # alle anderen Befehle (ab v5)
 
 
 # ----------------------------------------------------------------- Screenshots als Polaroid
@@ -159,7 +179,7 @@ def send_image(img, caption="", secs=0):
     cap = ascii_only(caption, 38)
     cfg = load_cfg()
     ports = ([cfg["port"]] if cfg.get("port") else []) + find_ports()
-    for p in (dict.fromkeys(ports) if not secs else []):
+    for p in (dict.fromkeys(ports) if not (secs or FORCE_WLAN) else []):
         for _ in range(3):
             try:
                 s = open_port(p)
@@ -176,18 +196,9 @@ def send_image(img, caption="", secs=0):
                     time.sleep(0.05)
                     continue
                 break
-    host = cfg.get("host")
-    if host:
-        try:
-            import urllib.parse, urllib.request
-            q = urllib.parse.urlencode({"w": w, "h": h, "c": cap, "s": int(secs)})
-            req = urllib.request.Request("http://%s/img?%s" % (host, q), data=b64.encode("ascii"),
-                                         headers={"Content-Type": "text/plain"})
-            urllib.request.urlopen(req, timeout=3).read()
-            return True
-        except Exception:
-            pass
-    return False
+    import urllib.parse
+    q = urllib.parse.urlencode({"w": w, "h": h, "c": cap, "s": int(secs)})
+    return http("/img?" + q, data=b64.encode("ascii"), timeout=3) is not None
 
 
 def find_image(obj, depth=0):
@@ -500,7 +511,9 @@ def uninstall():
 
 
 def query_device():
-    for p in ([load_cfg().get("port")] if load_cfg().get("port") else []) + find_ports():
+    """(Verbindung, IP) - Verbindung ist der USB-Port oder "WLAN"."""
+    global DEVICE_VERSION
+    for p in ([] if FORCE_WLAN else ([load_cfg().get("port")] if load_cfg().get("port") else []) + find_ports()):
         try:
             s = open_port(p)
             s.reset_input_buffer()
@@ -516,11 +529,17 @@ def query_device():
             txt = buf.decode("ascii", "replace")
             if "BUDDY" in txt:
                 parts = txt.split("BUDDY", 1)[1].splitlines()[0].split()  # "<ip oder -> v<version>"
-                global DEVICE_VERSION
                 DEVICE_VERSION = parts[1] if len(parts) > 1 else "v1"
                 return p, (parts[0] if parts else "-")
         except Exception:
             pass
+    txt = http("/cmd?l=%3F", timeout=1.5)  # ueber WLAN fragen (ab v5)
+    if txt and txt.startswith("BUDDY"):
+        parts = txt.split()
+        DEVICE_VERSION = parts[2] if len(parts) > 2 else "?"
+        return "WLAN", parts[1] if len(parts) > 1 else "-"
+    if txt is None and http("/status", timeout=1.5):  # aeltere Firmware ohne /cmd
+        return "WLAN", load_cfg().get("host")
     return None, None
 
 
@@ -531,13 +550,14 @@ def find():
     port, ip = query_device()
     cfg = load_cfg()
     if port:
-        cfg["port"] = port
+        if port != "WLAN":
+            cfg["port"] = port
         if ip and ip != "-":
             cfg["host"] = ip
         save_cfg(cfg)
-        print("Gefunden an %s, WLAN: %s, Firmware %s" % (port, ip, DEVICE_VERSION))
+        print("Gefunden %s %s, WLAN: %s, Firmware %s" % ("per" if port == "WLAN" else "an", port, ip, DEVICE_VERSION))
     else:
-        print("Kein Buddy per USB gefunden.", "WLAN-Adresse: %s" % cfg.get("host") if cfg.get("host") else "")
+        print("Kein Buddy gefunden (weder USB noch WLAN).")
 
 
 def wifi():
@@ -545,7 +565,7 @@ def wifi():
     ssid = input("WLAN-Name (leer = WLAN aus): ").strip()
     pw = getpass.getpass("Passwort: ") if ssid else ""
     if not send_line("W %s|%s" % (ssid, pw)):
-        print("Geraet nicht erreicht (USB angeschlossen?)")
+        print("Geraet nicht erreicht (weder USB noch WLAN)")
         return
     print("Gespeichert, warte auf Verbindung ...")
     for _ in range(15):
