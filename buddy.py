@@ -10,6 +10,7 @@ Aufrufe:
   python buddy.py long <min>      lange Arbeit testen (ab 5 Schweiss, 10 Kaffee, 15 Dampf)
   python buddy.py wifi            WLAN-Zugang ueber USB ins Geraet schreiben
   python buddy.py find            Geraet suchen, Verbindung pruefen
+  python buddy.py update          Buddy sofort nach neuer Firmware suchen lassen
   python buddy.py install         Hooks in Claude Code eintragen (~/.claude/settings.json)
   python buddy.py uninstall       Hooks wieder entfernen
 
@@ -103,9 +104,9 @@ def send_line(line):
     host = cfg.get("host")
     if line.startswith("S "):
         import urllib.parse, urllib.request
-        st, _, rest = line[2:].partition("|")
-        d, _, ts = rest.partition("|")
-        q = urllib.parse.urlencode({"st": st, "d": d, "t": ts})
+        f = line[2:].split("|")
+        f += [""] * (5 - len(f))
+        q = urllib.parse.urlencode({"st": f[0], "d": f[1], "t": f[2], "sid": f[3], "p": f[4]})
         if host:
             try:
                 urllib.request.urlopen("http://%s/s?%s" % (host, q), timeout=0.6).read()
@@ -141,11 +142,11 @@ def log(msg):
         pass
 
 
-def send_state(state, detail=""):
+def send_state(state, detail="", sid="", proj=""):
     # Zeitstempel: Hooks laufen parallel, das Geraet verwirft veraltete Meldungen
     ts = int(time.time() * 1000) & 0xFFFFFFFF
     t0 = time.time()
-    ok = send_line("S %s|%s|%d" % (state, ascii_only(detail), ts))
+    ok = send_line("S %s|%s|%d|%s|%s" % (state, ascii_only(detail), ts, ascii_only(sid, 12), ascii_only(proj, 19)))
     log("%-6s %-24s %s %dms" % (state, ascii_only(detail, 24), "ok" if ok else "FEHLER", (time.time() - t0) * 1000))
     return ok
 
@@ -203,32 +204,34 @@ def handle_hook():
     LOG_SESSION = str(ev.get("session_id", ""))
     name = ev.get("hook_event_name", "")
     cwd = base(ev.get("cwd", ""))
+    sid = str(ev.get("session_id", ""))[:8]  # jede Claude-Code-Sitzung bekommt am Buddy eine eigene Figur
+
+    def send(st, d=""):
+        send_state(st, d, sid, cwd)
     if name == "SessionStart":
-        send_state("hello", cwd)
+        send("hello")
     elif name == "UserPromptSubmit":
-        send_state("think", cwd)
+        send("think")
     elif name == "PreToolUse":
         st, d = tool_state(ev.get("tool_name", ""), ev.get("tool_input"))
-        send_state(st, d)
+        send(st, d)
     elif name == "PostToolUse":
-        send_state("think", "")
+        send("think")
     elif name == "PostToolUseFailure":
-        send_state("think", "")
+        send("oops", ev.get("tool_name", ""))  # Befehl ist fehlgeschlagen: kurzer Schreck
     elif name == "Notification":
         msg = str(ev.get("message", ""))
         ntype = str(ev.get("notification_type", ""))
         if "permission" in ntype or "permission" in msg.lower() or "erlaubnis" in msg.lower():
-            send_state("need", "Erlaubnis noetig")
+            send("need")
         elif "idle" in ntype or "waiting" in msg.lower():
-            send_state("wait", cwd)
+            send("wait")
         else:
-            send_state("need", msg)
+            send("need")
     elif name == "Stop":
-        send_state("done", cwd)
-    elif name == "SubagentStop":
-        pass
+        send("done")
     elif name == "SessionEnd":
-        send_state("bye", "")
+        send("bye")
     # Hooks duerfen Claude nie aufhalten
     sys.exit(0)
 
@@ -255,7 +258,7 @@ def demo2():
     send_state("idle", "")
 
 
-HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd"]
+HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "Notification", "Stop", "SessionEnd"]
 
 
 def settings_path():
@@ -282,7 +285,7 @@ def install():
         if ev != "SessionEnd":
             h["async"] = True  # Claude wartet nicht auf den Buddy
         g = {"hooks": [h]}
-        if ev in ("PreToolUse", "PostToolUse"):
+        if ev in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
             g["matcher"] = "*"
         groups.append(g)
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -330,11 +333,16 @@ def query_device():
             s.close()
             txt = buf.decode("ascii", "replace")
             if "BUDDY" in txt:
-                line = txt.split("BUDDY", 1)[1].splitlines()[0].strip()
-                return p, line
+                parts = txt.split("BUDDY", 1)[1].splitlines()[0].split()  # "<ip oder -> v<version>"
+                global DEVICE_VERSION
+                DEVICE_VERSION = parts[1] if len(parts) > 1 else "v1"
+                return p, (parts[0] if parts else "-")
         except Exception:
             pass
     return None, None
+
+
+DEVICE_VERSION = "?"
 
 
 def find():
@@ -345,7 +353,7 @@ def find():
         if ip and ip != "-":
             cfg["host"] = ip
         save_cfg(cfg)
-        print("Gefunden an %s, WLAN: %s" % (port, ip))
+        print("Gefunden an %s, WLAN: %s, Firmware %s" % (port, ip, DEVICE_VERSION))
     else:
         print("Kein Buddy per USB gefunden.", "WLAN-Adresse: %s" % cfg.get("host") if cfg.get("host") else "")
 
@@ -396,6 +404,8 @@ if __name__ == "__main__":
         wifi()
     elif cmd == "find":
         find()
+    elif cmd == "update":
+        print("ok - der Buddy sucht jetzt nach einem Update" if send_line("U") else "Geraet nicht erreicht")
     elif cmd == "install":
         install()
     elif cmd == "uninstall":

@@ -34,7 +34,10 @@ Im Leerlauf spielt er Jo-Jo, liest, gießt seine Pflanze (sie wächst mit jeder 
 - **IO14** kurz: Info / „gesehen“ · lang: Einstellungen (Lautstärke, Ticks, LED, Display-Helligkeit, Bild drehen)
 - **beide 2 s:** WLAN per Handy einrichten
 
+Im WLAN holt sich der Buddy neue Versionen nachts von selbst (abschaltbar in den Einstellungen, dort auch „Jetzt aktualisieren“ und die Sprache Deutsch/Englisch).
+Laufen mehrere Claude-Code-Sitzungen gleichzeitig, zeigen kleine Mini-Buddys oben die anderen Projekte; Fragen und Erlaubnisse haben immer Vorrang.
+
 ## English
 
 A little companion on the LILYGO T-Display-S3 that shows what Claude Code is doing. Flash the firmware from the page above,
-then run `pip install pyserial` and `python buddy.py install` on your PC. The display speaks German.
+then run `pip install pyserial` and `python buddy.py install` on your PC. Display language German or English (settings). Over Wi-Fi it updates itself at night.
