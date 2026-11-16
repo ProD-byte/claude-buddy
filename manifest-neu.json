@@ -1,0 +1,16 @@
+{
+  "name": "Claude-Buddy (Neuinstallation)",
+  "version": "1",
+  "new_install_prompt_erase": false,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        {
+          "path": "buddy-komplett.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}

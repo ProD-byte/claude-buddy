@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Claude-Buddy</title>
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<style>
+:root{--bg:#1f1e1c;--card:#2b2a27;--line:#45423d;--ink:#f2eee6;--mute:#a39e95;--acc:#d97757;color-scheme:dark}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:860px;margin:0 auto;padding:24px 16px 48px}
+h1{margin:0 0 4px}.mute{color:var(--mute)}
+.box{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin-top:16px}
+button{background:var(--acc);color:#fff;border:0;border-radius:10px;padding:10px 16px;font:600 15px system-ui;cursor:pointer}
+a{color:var(--acc)} code{background:#00000040;padding:1px 5px;border-radius:5px}
+iframe{display:block;width:100%;height:1300px;border:0;margin-top:16px}
+</style>
+</head>
+<body><main>
+<h1>Claude-Buddy</h1>
+<p class="mute"><span data-i="for">Zeigt auf dem LILYGO T-Display-S3, was Claude Code gerade macht.</span> · Build 1 ·
+<span data-i="inof">Inoffizielles Bastelprojekt, kein Produkt von Anthropic.</span></p>
+<div class="box">
+<h2 data-i="fh">⚡ Firmware</h2>
+<p data-i="up">Update: Einstellungen und WLAN bleiben erhalten. Bei „Erase device?“ den Haken <b>nicht</b> setzen.</p>
+<esp-web-install-button manifest="manifest-update.json"><button slot="activate" data-i="upb">⚡ Update installieren</button>
+<span slot="unsupported" data-i="uns">Bitte Chrome oder Edge am Computer verwenden.</span><span slot="not-allowed">https only</span></esp-web-install-button>
+<p data-i="neup">Neuinstallation: löscht alles – für neue Boards oder wenn nichts mehr geht.</p>
+<esp-web-install-button manifest="manifest-neu.json"><button slot="activate" data-i="neub">🗑️ Löschen &amp; neu installieren</button>
+<span slot="unsupported" data-i="uns2">Bitte Chrome oder Edge am Computer verwenden.</span><span slot="not-allowed">https only</span></esp-web-install-button>
+</div>
+<div class="box">
+<h2 data-i="ph">💻 PC einrichten</h2>
+<p data-i="pp">Python installieren, dann <a href="buddy.py" download>buddy.py</a> herunterladen und im selben Ordner ausführen:</p>
+<p><code>pip install pyserial</code><br><code>python buddy.py install</code></p>
+<p data-i="pp2">Das trägt Hooks in Claude Code ein. Jede neue Sitzung meldet dem Buddy dann, was sie gerade tut – per USB oder WLAN (<code>python buddy.py wifi</code> bzw. am Gerät beide Tasten 2 s halten). Testen: <code>python buddy.py demo</code>.</p>
+</div>
+<iframe id="sim" src="simulation.html" title="Claude-Buddy Simulation"></iframe>
+<script>
+if (!(navigator.language || 'de').toLowerCase().startsWith('de')) {
+  const TX = {for: 'Shows on the LILYGO T-Display-S3 what Claude Code is doing right now.', inof: 'Unofficial hobby project, not a product of Anthropic.',
+    fh: '⚡ Firmware', up: 'Update: settings and Wi-Fi are kept. Do <b>not</b> tick “Erase device?”.', upb: '⚡ Install update',
+    uns: 'Please use Chrome or Edge on a computer.', uns2: 'Please use Chrome or Edge on a computer.',
+    neup: 'Fresh install: erases everything – for new boards or when nothing works anymore.', neub: '🗑️ Erase &amp; install',
+    ph: '💻 Set up the PC', pp: 'Install Python, then download <a href="buddy.py" download>buddy.py</a> and run in the same folder:',
+    pp2: 'This adds hooks to Claude Code. Every new session then tells the buddy what it is doing – via USB or Wi-Fi (<code>python buddy.py wifi</code>, or hold both buttons on the device for 2 s). Test: <code>python buddy.py demo</code>.'};
+  document.documentElement.lang = 'en';
+  document.querySelectorAll('[data-i]').forEach(e => { if (TX[e.dataset.i]) e.innerHTML = TX[e.dataset.i]; });
+  document.getElementById('sim').src = 'simulation.html?lang=en';
+}
+</script>
+</main></body>
+</html>
