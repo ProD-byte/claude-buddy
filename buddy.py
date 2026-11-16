@@ -26,6 +26,9 @@ Aufrufe:
   python buddy.py frage <text>    Freigabe am Watcher-Knopf testen (druecken = ja, drehen = nein); im Betrieb fragt der
                                   PermissionRequest-Hook so, 20 s lang (config.json: "freigabe_sek", 0 = aus)
   python buddy.py wurf            Ball von einem Buddy zum anderen werfen (passiert sonst beim Sitzungswechsel)
+  python buddy.py ort <stadt>     Ort fuer das Wetter (Open-Meteo, ohne Konto); das Zuhoeren schickt es alle 20 min
+  python buddy.py geburtstag TT.MM.   an dem Tag gibt es Torte und Gratulation
+  python buddy.py plaudern        die zwei Buddys sofort plaudern lassen (passiert sonst ab und zu von selbst)
   python buddy.py zuhoeren [--ohne-enter]  laeuft dauerhaft: Knopf am Watcher halten und sprechen -> Text wird
                                   offline erkannt (faster-whisper) und ins aktive Fenster eingefuegt + Enter
   python buddy.py install         Hooks in Claude Code eintragen (~/.claude/settings.json); mit Watcher auf Wunsch
@@ -1415,6 +1418,85 @@ def transcribe(model, wav):
     return " ".join(s.text.strip() for s in segs).strip()
 
 
+# ----------------------------------------------------------------- Wetter und Plaudereien (laeuft im Zuhoeren mit)
+# Wetter von Open-Meteo (ohne Konto) fuer den Ort aus config.json ("lat", "lon"), alle 20 Minuten an alle Buddys.
+# Sind beide Buddys untaetig, plaudern sie ab und zu miteinander (Sprechblasen, Befehl "C <text>").
+PLAUDEREIEN = [
+    [(0, "Psst... bist du wach?"), (1, "Jetzt schon!"), (0, "~wave"), (1, "~wave")],
+    [(0, "Ganz schoen ruhig hier."), (1, "Pssst, er denkt nach!")],
+    [(0, "Was machst du so?"), (1, "Ich warte auf Arbeit."), (0, "Ich auch!")],
+    [(0, "Ich hab heute schon viel gelernt."), (1, "Angeber!"), (0, "Hehe.")],
+    [(0, "Weisst du einen Witz?"), (1, "Was macht ein Pirat am PC?"), (1, "Er drueckt Enter!"), (0, "Hahaha!")],
+    [(0, "Meine Pflanze waechst!"), (1, "Meine auch!"), (0, "Wettgiessen?")],
+    [(0, "~wave"), (1, "Huhu!"), (0, "Huhu zurueck!")],
+    [(0, "Ob er gleich wieder tippt?"), (1, "Bestimmt!"), (0, "Ich bin bereit.")],
+    [(0, "Ich hab Hunger."), (1, "Wir essen Strom."), (0, "Lecker Strom!")],
+    [(0, "Wie spaet ist es?"), (1, "Zeit fuer Code!")],
+    [(0, "Gibts was Neues?"), (1, "Alles gruen bei mir."), (0, "Prima!")],
+    [(0, "Schoenes Wetter heute?"), (1, "Ich seh nur Pixel."), (0, "Hihi.")],
+    [(0, "Magst du Kaffee?"), (1, "Nur Bits und Bytes."), (0, "Ich auch.")],
+    [(0, "Lass uns tanzen!"), (1, "Ohne Musik?"), (0, "Na gut, spaeter.")],
+]
+
+
+import threading
+WX_EVENT = threading.Event()  # gesetzt, wenn ein Buddy kein Wetter hat (z.B. nach einem Neustart)
+
+
+def extras_loop():
+    """Hintergrund: Wetter holen und verteilen, Buddys plaudern lassen."""
+    import random
+    import urllib.parse
+    import urllib.request
+
+    def to_all(line, devs):
+        for ip in devs:
+            try:
+                urllib.request.urlopen("http://%s/cmd?%s" % (ip, urllib.parse.urlencode({"l": line})), timeout=2).read()
+            except Exception:
+                pass
+
+    next_wx, next_chat = 0, time.time() + random.uniform(180, 420)
+    while True:
+        try:
+            cfg = load_cfg()
+            devs = list((cfg.get("devices") or {}).keys())
+            now = time.time()
+            if WX_EVENT.is_set():
+                WX_EVENT.clear()
+                next_wx = 0
+            if now >= next_wx and devs:
+                next_wx = now + 20 * 60
+                lat, lon = cfg.get("lat"), cfg.get("lon")
+                if lat is not None and lon is not None:
+                    url = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
+                           "&current=weather_code,is_day,temperature_2m&timezone=auto") % (lat, lon)
+                    cur = json.loads(urllib.request.urlopen(url, timeout=10).read())["current"]
+                    line = "E %d|%d|%d" % (cur["weather_code"], cur["is_day"], round(cur["temperature_2m"]))
+                    to_all(line, devs)
+                    zlog("Wetter: Code %s, %s, %.0f Grad" % (cur["weather_code"], "Tag" if cur["is_day"] else "Nacht", cur["temperature_2m"]))
+                if cfg.get("geburtstag"):
+                    to_all("G " + cfg["geburtstag"], devs)
+            if now >= next_chat:
+                next_chat = now + random.uniform(240, 600)
+                if len(devs) >= 2 and cfg.get("plaudern", True):
+                    states = []
+                    for ip in devs[:2]:
+                        try:
+                            states.append(urllib.request.urlopen("http://%s/" % ip, timeout=2).read().decode("ascii", "replace"))
+                        except Exception:
+                            states.append("")
+                    if all(s.endswith(("idle", "wait")) for s in states):
+                        pair = devs[:2]
+                        random.shuffle(pair)
+                        for who, text in random.choice(PLAUDEREIEN):
+                            to_all("C " + ascii_only(text, 40), [pair[who]])
+                            time.sleep(1.6 if text == "~wave" else 3.0)
+        except Exception as e:
+            zlog("Extras: %s" % e)
+        WX_EVENT.wait(15)
+
+
 def zuhoeren(args):
     """Laeuft dauerhaft: Sprachaufnahmen vom Watcher holen, erkennen, einfuegen."""
     import socket
@@ -1432,7 +1514,10 @@ def zuhoeren(args):
     from faster_whisper import WhisperModel
     model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     zlog("bereit - Knopf am Watcher halten und sprechen")
+    import threading
+    threading.Thread(target=extras_loop, daemon=True).start()  # Wetter + Plaudereien
     host, last_id, last_find = None, None, 0
+    polls, beat, last_st, trace_until, fails, wx_asked = 0, 0, 0, 0, 0, 0
     while True:
         try:
             if not host or time.time() - last_find > 60:
@@ -1444,10 +1529,27 @@ def zuhoeren(args):
                 if not host:
                     time.sleep(3)
                     continue
-            st = json.loads(urllib.request.urlopen("http://%s/rec" % host, timeout=2).read())
-            if last_id is None:
-                last_id = st["id"]  # alte Aufnahme beim Start nicht noch einmal verarbeiten
-            if st["st"] == 2 and st["id"] != last_id:
+            tq = time.time()
+            st = json.loads(urllib.request.urlopen("http://%s/rec" % host, timeout=1.5).read())
+            fails = 0
+            polls += 1
+            if st.get("wx") == 0 and time.time() - wx_asked > 60:  # Watcher hat kein Wetter: sofort schicken
+                wx_asked = time.time()
+                WX_EVENT.set()
+            if st["st"] != last_st:
+                if st["st"]:
+                    zlog("Watcher: %s" % {1: "nimmt auf", 2: "Aufnahme wartet", 3: "abgeholt"}.get(st["st"], st["st"]))
+                    if st["st"] == 1:
+                        trace_until = time.time() + 15
+                last_st = st["st"]
+            if time.time() < trace_until:  # Fehlersuche: jede Abfrage nach Aufnahmebeginn mitschreiben
+                zlog("  Abfrage: %s (%.2f s)" % (st, time.time() - tq))
+            if polls == 1 or time.time() - beat > 600:  # Lebenszeichen im Protokoll
+                beat = time.time()
+                zlog("lebt (%d Abfragen, Watcher meldet %s)" % (polls, st))
+            # st 2 = Aufnahme wartet auf den PC (nach dem Abholen wird daraus 3). Die Nummer allein reicht nicht:
+            # nach einem Neustart des Watchers (z.B. Update) faengt sie wieder bei 1 an.
+            if st["st"] == 2:
                 last_id = st["id"]
                 wav = urllib.request.urlopen("http://%s/rec.wav" % host, timeout=10).read()
                 t0 = time.time()
@@ -1460,10 +1562,15 @@ def zuhoeren(args):
             time.sleep(0.35)
         except KeyboardInterrupt:
             return
-        except Exception as e:  # Watcher kurz weg (Neustart, WLAN): weiter versuchen
-            zlog("Fehler: %s" % e)
-            host = None
-            time.sleep(3)
+        except Exception as e:  # WLAN-Aussetzer (z.B. Hand ueber der Antenne) oder Watcher startet neu
+            fails += 1
+            if fails <= 3 or fails % 20 == 0:
+                zlog("Fehler (%d): %s" % (fails, e))
+            if fails >= 10:  # laenger weg: Watcher neu suchen
+                host = None
+                time.sleep(3)
+            else:
+                time.sleep(0.5)  # sofort nochmal, die Aufnahme wartet
 
 
 def foto_save(jpg, show=True, rotate=None):
@@ -1551,6 +1658,44 @@ if __name__ == "__main__":
         print("ok" if say(" ".join(sys.argv[2:]) or "Hallo, ich bin dein Claude-Buddy.") else "nicht geklappt (Watcher im WLAN? Vorlesen an?)")
     elif cmd == "frage":  # Freigabe am Knopf testen
         print(ask_knob(" ".join(sys.argv[2:]) or "Bash: echo Test") or "keine Antwort")
+    elif cmd == "ort":  # Wetter-Ort festlegen: python buddy.py ort Cottbus
+        import urllib.parse
+        import urllib.request
+        q = " ".join(sys.argv[2:])
+        r = json.loads(urllib.request.urlopen("https://geocoding-api.open-meteo.com/v1/search?" +
+                                              urllib.parse.urlencode({"name": q, "count": 1, "language": "de"}), timeout=10).read())
+        if not r.get("results"):
+            print("Ort nicht gefunden (Stadtname probieren, Postleitzahlen kennt der Dienst oft nicht).")
+        else:
+            res = r["results"][0]
+            c = load_cfg()
+            c["ort"], c["lat"], c["lon"] = res["name"], round(res["latitude"], 3), round(res["longitude"], 3)
+            save_cfg(c)
+            print("Wetter fuer %s (%s, %s) - kommt mit dem naechsten Zuhoeren-Durchlauf" % (res["name"], c["lat"], c["lon"]))
+    elif cmd == "geburtstag":  # python buddy.py geburtstag 24.12.
+        import re
+        m = re.match(r"\s*(\d{1,2})\.(\d{1,2})", " ".join(sys.argv[2:]))
+        if m:
+            c = load_cfg()
+            c["geburtstag"] = "%02d-%02d" % (int(m.group(2)), int(m.group(1)))
+            save_cfg(c)
+            send_line("G " + c["geburtstag"])
+            print("Geburtstag gespeichert (nur Tag und Monat).")
+        else:
+            print("Bitte als TT.MM. angeben, z.B. 24.12.")
+    elif cmd == "plaudern":  # beide Buddys sofort plaudern lassen (Test)
+        import random
+        import urllib.parse
+        import urllib.request
+        devs = list((load_cfg().get("devices") or {}).keys())[:2]
+        if len(devs) < 2:
+            print("Dafuer braucht es zwei Buddys im WLAN.")
+        else:
+            random.shuffle(devs)
+            for who, text in random.choice(PLAUDEREIEN):
+                urllib.request.urlopen("http://%s/cmd?%s" % (devs[who], urllib.parse.urlencode({"l": "C " + ascii_only(text, 40)})), timeout=2).read()
+                time.sleep(1.6 if text == "~wave" else 3.0)
+            print("geplaudert")
     elif cmd == "wurf":  # Ball werfen testen (braucht zwei Buddys im WLAN)
         c = load_cfg()
         c["wurf_sid"], c["wurf_t"], c["wurf_zuletzt"] = "test-alt", time.time(), 0
