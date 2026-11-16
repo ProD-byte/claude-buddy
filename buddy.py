@@ -41,7 +41,7 @@ Aufrufe:
   python buddy.py flash <ip> <firmware.bin>  Firmware per WLAN aufspielen (pio run -e watcher-wlan -t upload)
 
 Sicherheit: Im WLAN nimmt ein Buddy Befehle nur von gekoppelten PCs an. Die Schluessel stehen in
-config.json ("kopplung"); geht etwas schief, koppelt buddy.py per USB oder Knopfdruck neu.
+pc/kopplung.json; geht etwas schief, koppelt buddy.py per USB oder Knopfdruck neu.
 
 Verbindung: zuerst USB, sonst WLAN (IP aus config.json, sonst claude-buddy.local).
 Alle Buddys bekommen die Meldung: angesteckte per USB (T-Display-S3 am Espressif-Port,
@@ -78,18 +78,41 @@ def save_cfg(cfg):
 
 
 # ---------------------------------------------------------------- Kopplung (Schluessel statt Passwort)
+# Eigene Datei, nur beim Koppeln geschrieben: config.json schreiben die Hooks staendig, eine alte Kopie
+# koennte sonst einen frischen Schluessel wieder ueberschreiben.
+KOPPL_FILE = os.path.join(HERE, "kopplung.json")
 _TOK_CACHE = {"t": None, "map": {}}
 
 
 def _kopplung(cfg=None):
-    return (cfg if cfg is not None else load_cfg()).get("kopplung") or {}
+    """{mac: {"token", "ip", "name"}}"""
+    try:
+        with open(KOPPL_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        old = load_cfg().get("kopplung") or {}  # frueher in config.json
+        if old:
+            _save_kopplung(old)
+        return old
+    except Exception:
+        return {}
+
+
+def _save_kopplung(k):
+    tmp = KOPPL_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(k, f, indent=2)
+    os.replace(tmp, KOPPL_FILE)  # auf einen Schlag, nie halb geschrieben
 
 
 def token_for(host):
-    """Schluessel fuer eine Buddy-Adresse (config.json "kopplung" = {mac: {"token", "ip", "name"}})."""
+    """Schluessel fuer eine Buddy-Adresse."""
     try:
-        mt = os.path.getmtime(CFG_FILE)
+        mt = os.path.getmtime(KOPPL_FILE)
     except OSError:
+        if not os.path.exists(KOPPL_FILE) and (load_cfg().get("kopplung")):
+            _kopplung()  # einmalig umziehen
+            return token_for(host)
         return None
     if _TOK_CACHE["t"] != mt:
         _TOK_CACHE["t"] = mt
@@ -98,12 +121,11 @@ def token_for(host):
 
 
 def store_token(mac, token, ip, name=""):
-    cfg = load_cfg()
-    k = cfg.setdefault("kopplung", {})
+    k = _kopplung()
     for m in [m for m, v in k.items() if m != mac and v.get("ip") == ip]:
         del k[m]  # andere Adresse gehoert jetzt diesem Geraet
     k[mac] = {"token": token, "ip": ip, "name": name or (k.get(mac) or {}).get("name", "")}
-    save_cfg(cfg)
+    _save_kopplung(k)
     _TOK_CACHE["t"] = None
 
 
@@ -152,12 +174,17 @@ def device_mac(host):
         return None
 
 
-def paired_ok(host):
-    """True = gekoppelt (oder alte Firmware ohne Kopplung), False = Buddy will einen Schluessel."""
-    try:
-        return bool(json.loads(_raw_get("http://%s/pair?test=1" % host, 2, token_for(host))).get("ok"))
-    except Exception as e:
-        return getattr(e, "code", 0) == 404  # alte Firmware: kennt /pair nicht
+def paired_ok(host, tries=3):
+    """True = gekoppelt (oder alte Firmware ohne Kopplung), False = Buddy lehnt den Schluessel ab,
+    None = nicht erreichbar. Nur bei False neu koppeln - eine neue Kopplung macht den alten Schluessel ungueltig."""
+    for i in range(tries):
+        try:
+            return bool(json.loads(_raw_get("http://%s/pair?test=1" % host, 3, token_for(host))).get("ok"))
+        except Exception as e:
+            if getattr(e, "code", 0) == 404:
+                return True  # alte Firmware: kennt /pair nicht
+            time.sleep(1)
+    return None
 
 
 def repair_token(host):
@@ -250,7 +277,7 @@ def koppeln(args):
                 print("%s antwortet nicht" % port)
                 continue
             ip = r[0]
-            if ip != "-" and not neu and token_for(ip) and paired_ok(ip):
+            if ip != "-" and not neu and token_for(ip) and paired_ok(ip) is True:
                 print("%s (%s): schon gekoppelt" % (port, ip))
                 done.add(ip)
                 continue
@@ -267,7 +294,11 @@ def koppeln(args):
             if v.get("ip") and v["ip"] not in done and v["ip"] not in ips:
                 ips.append(v["ip"])
     for ip in ips:
-        if not neu and paired_ok(ip):
+        ok = paired_ok(ip)
+        if ok is None:
+            print("%s antwortet nicht" % ip)
+            continue
+        if ok and not neu:
             print("%s: schon gekoppelt" % ip)
             continue
         if device_mac(ip) is None and not neu:
@@ -290,7 +321,11 @@ def flash(ip, binfile):
     bnd = uuid.uuid4().hex
     body = (("--%s\r\nContent-Disposition: form-data; name=\"firmware\"; filename=\"firmware.bin\"\r\n"
              "Content-Type: application/octet-stream\r\n\r\n" % bnd).encode() + data + ("\r\n--%s--\r\n" % bnd).encode())
-    if not paired_ok(ip):
+    ok = paired_ok(ip)
+    if ok is None:
+        print("%s antwortet nicht" % ip)
+        sys.exit(1)
+    if not ok:
         print("%s ist nicht gekoppelt - Kopplung per Knopfdruck ..." % ip)
         if not button_pair(ip):
             sys.exit(1)
@@ -1861,7 +1896,7 @@ def zuhoeren(args):
         except KeyboardInterrupt:
             return
         except Exception as e:  # WLAN-Aussetzer (z.B. Hand ueber der Antenne) oder Watcher startet neu
-            if getattr(e, "code", 0) == 401 and host and time.time() - pair_asked > 600:
+            if getattr(e, "code", 0) == 401 and host and time.time() - pair_asked > 600 and paired_ok(host) is False:
                 pair_asked = time.time()
                 zlog("Watcher %s ist nicht gekoppelt - frage per Knopfdruck" % host)
                 zlog("gekoppelt" if button_pair(host, quiet=True) else "nicht gekoppelt (python buddy.py koppeln)")
