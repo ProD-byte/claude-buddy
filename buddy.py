@@ -10,6 +10,7 @@ Aufrufe:
   python buddy.py long <min>      lange Arbeit testen (ab 5 Schweiss, 10 Kaffee, 15 Dampf)
   python buddy.py wifi            WLAN-Zugang ueber USB ins Geraet schreiben
   python buddy.py find            Geraet suchen, Verbindung pruefen
+  python buddy.py bild <datei> [s] Bild als Polaroid zeigen, optional s Sekunden (braucht pillow)
   python buddy.py update          Buddy sofort nach neuer Firmware suchen lassen
   python buddy.py install         Hooks in Claude Code eintragen (~/.claude/settings.json)
   python buddy.py uninstall       Hooks wieder entfernen
@@ -127,6 +128,112 @@ def send_line(line):
     return False
 
 
+# ----------------------------------------------------------------- Screenshots als Polaroid
+IMG_W, IMG_H = 168, 104
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+
+
+def image_payload(img):
+    """Pillow-Bild -> (Breite, Hoehe, Base64 der RGB565-Pixel, little endian)."""
+    import base64
+    img = img.convert("RGB")
+    img.thumbnail((IMG_W, IMG_H))
+    w, h = img.size
+    px = img.tobytes()
+    out = bytearray(w * h * 2)
+    for i in range(w * h):
+        r, g, b = px[3 * i], px[3 * i + 1], px[3 * i + 2]
+        v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        out[2 * i] = v & 0xFF
+        out[2 * i + 1] = v >> 8
+    return w, h, base64.b64encode(bytes(out)).decode("ascii")
+
+
+def send_image(img, caption="", secs=0):
+    """Zeigt ein Bild als Polaroid auf dem Buddy (USB, sonst WLAN).
+    secs > 0: so lange stehen lassen (geht nur ueber WLAN)."""
+    try:
+        w, h, b64 = image_payload(img)
+    except Exception:
+        return False
+    cap = ascii_only(caption, 38)
+    cfg = load_cfg()
+    ports = ([cfg["port"]] if cfg.get("port") else []) + find_ports()
+    for p in (dict.fromkeys(ports) if not secs else []):
+        for _ in range(3):
+            try:
+                s = open_port(p)
+                s.write_timeout = 3
+                data = ("P %d %d %s|" % (w, h, cap)).encode("ascii") + b64.encode("ascii") + b"\n"
+                for i in range(0, len(data), 2048):  # in Haeppchen, sonst laeuft der Empfangspuffer im Buddy ueber
+                    s.write(data[i:i + 2048])
+                    s.flush()
+                    time.sleep(0.03)
+                s.close()
+                return True
+            except Exception as e:
+                if "PermissionError" in repr(e) or "Zugriff" in str(e):
+                    time.sleep(0.05)
+                    continue
+                break
+    host = cfg.get("host")
+    if host:
+        try:
+            import urllib.parse, urllib.request
+            q = urllib.parse.urlencode({"w": w, "h": h, "c": cap, "s": int(secs)})
+            req = urllib.request.Request("http://%s/img?%s" % (host, q), data=b64.encode("ascii"),
+                                         headers={"Content-Type": "text/plain"})
+            urllib.request.urlopen(req, timeout=3).read()
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def find_image(obj, depth=0):
+    """Sucht im Ergebnis eines Werkzeugs nach einem eingebetteten Bild (Base64)."""
+    if depth > 6:
+        return None
+    if isinstance(obj, dict):
+        if obj.get("type") == "image":
+            data = obj.get("data") or (obj.get("source") or {}).get("data")
+            if isinstance(data, str) and len(data) > 100:
+                return data
+        for v in obj.values():
+            r = find_image(v, depth + 1)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = find_image(v, depth + 1)
+            if r:
+                return r
+    return None
+
+
+def image_from_tool(name, inp, resp):
+    """Liefert (Pillow-Bild, Titel), wenn das Werkzeug ein Bild angesehen oder einen Screenshot gemacht hat."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None, ""
+    import base64, io
+    inp = inp or {}
+    path = str(inp.get("file_path") or "")
+    if name == "Read" and path.lower().endswith(IMAGE_EXT) and os.path.exists(path):
+        try:
+            return Image.open(path), base(path)
+        except Exception:
+            return None, ""
+    data = find_image(resp)
+    if data:
+        try:
+            return Image.open(io.BytesIO(base64.b64decode(data))), "Screenshot"
+        except Exception:
+            pass
+    return None, ""
+
+
 LOG_FILE = os.path.join(HERE, "hook.log")
 LOG_SESSION = ""
 
@@ -165,12 +272,66 @@ def base(p):
     return os.path.basename(str(p or "").rstrip("/\\")) or str(p or "")
 
 
+import re
+
+TEST_RE = re.compile(r"\b(pytest|unittest|jest|vitest|mocha|ctest|go test|cargo test|npm (run )?test|yarn test|pnpm test|pio test|gradle test|mvn test|phpunit|rspec)\b")
+UPLOAD_RE = re.compile(r"(-t upload|--target upload|\besptool\b|arduino-cli upload|\bavrdude\b|idf\.py .*flash|\bpio run -e ota)")
+BUILD_RE = re.compile(r"\b(pio run|platformio run|npm run build|yarn build|pnpm build|make\b|cmake --build|cargo build|go build|tsc\b|vite build|webpack|gradle build|mvn package|dotnet build|gcc|g\+\+|pip install|npm install|npm ci)")
+DELETE_RE = re.compile(r"(^|[;&|]\s*)(rm|del|rmdir|rd|remove-item|git rm)\b")
+
+
+def command_kind(cmd):
+    """Ordnet einen Terminal-Befehl einer Taetigkeit zu (fuer die passende Animation)."""
+    c = " ".join(str(cmd or "").lower().split())
+    if re.search(r"\bgit commit\b", c):
+        return "commit"
+    if re.search(r"\bgit push\b", c):
+        return "push"
+    if TEST_RE.search(c):
+        return "test"
+    if UPLOAD_RE.search(c):
+        return "upload"
+    if BUILD_RE.search(c):
+        return "build"
+    if DELETE_RE.search(c):
+        return "delete"
+    return "run"
+
+
+def commit_message(cmd):
+    m = re.search(r"-m\s+[\"']([^\"']+)", str(cmd or ""))
+    return m.group(1) if m else ""
+
+
+def line_diff(name, inp):
+    """'+12 -3' fuer Datei-Aenderungen."""
+    def n(t):
+        t = str(t or "")
+        return t.count("\n") + 1 if t else 0
+    if name == "Write":
+        return "+%d" % n(inp.get("content"))
+    if name == "MultiEdit":
+        add = sum(n(e.get("new_string")) for e in inp.get("edits", []) or [])
+        rem = sum(n(e.get("old_string")) for e in inp.get("edits", []) or [])
+        return "+%d -%d" % (add, rem)
+    if name == "Edit":
+        return "+%d -%d" % (n(inp.get("new_string")), n(inp.get("old_string")))
+    return ""
+
+
 def tool_state(name, inp):
     inp = inp or {}
     if name in READ_TOOLS:
         return "read", base(inp.get("file_path") or inp.get("notebook_path"))
     if name in WRITE_TOOLS:
-        return "write", base(inp.get("file_path") or inp.get("notebook_path"))
+        d = line_diff(name, inp)
+        return "write", (base(inp.get("file_path") or inp.get("notebook_path")) + ("  " + d if d else ""))
+    if name in ("Bash", "PowerShell"):
+        cmd = inp.get("command") or ""
+        kind = command_kind(cmd)
+        if kind == "commit":
+            return "commit", commit_message(cmd) or "git commit"
+        return kind, inp.get("description") or cmd
     if name in SEARCH_TOOLS:
         return "search", inp.get("pattern") or inp.get("query") or ""
     if name in RUN_TOOLS:
@@ -190,8 +351,12 @@ def tool_state(name, inp):
         if "browser" in name.lower() or "chrome" in name.lower():
             return "web", tool
         return "run", tool
-    if name in ("TodoWrite", "TaskCreate", "TaskUpdate"):
-        return "think", "plane"
+    if name == "TodoWrite":
+        todos = inp.get("todos") or []
+        done = sum(1 for t in todos if isinstance(t, dict) and t.get("status") == "completed")
+        return "plan", "%d/%d" % (done, len(todos))
+    if name in ("TaskCreate", "TaskUpdate"):
+        return "plan", ""
     return "think", name
 
 
@@ -216,9 +381,25 @@ def handle_hook():
         st, d = tool_state(ev.get("tool_name", ""), ev.get("tool_input"))
         send(st, d)
     elif name == "PostToolUse":
-        send("think")
+        tool, inp = ev.get("tool_name", ""), ev.get("tool_input") or {}
+        if tool in ("Bash", "PowerShell") and command_kind(inp.get("command")) == "test":
+            send("testok")  # Tests bestanden
+        else:
+            send("think")
+        img, cap = image_from_tool(tool, inp, ev.get("tool_response"))
+        if img is not None:
+            send_image(img, cap)  # Screenshot kurz als Polaroid zeigen
     elif name == "PostToolUseFailure":
-        send("oops", ev.get("tool_name", ""))  # Befehl ist fehlgeschlagen: kurzer Schreck
+        tool, inp = ev.get("tool_name", ""), ev.get("tool_input") or {}
+        if tool in ("Bash", "PowerShell") and command_kind(inp.get("command")) == "test":
+            send("testfail")
+        else:
+            send("oops", tool)  # Befehl ist fehlgeschlagen: kurzer Schreck
+    elif name == "PermissionRequest":
+        st, d = tool_state(ev.get("tool_name", ""), ev.get("tool_input"))
+        send("need", d)  # zeigt, wofuer Claude die Erlaubnis braucht
+    elif name == "PreCompact":
+        send("compact")
     elif name == "Notification":
         msg = str(ev.get("message", ""))
         ntype = str(ev.get("notification_type", ""))
@@ -258,7 +439,8 @@ def demo2():
     send_state("idle", "")
 
 
-HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "Notification", "Stop", "SessionEnd"]
+HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest",
+               "PreCompact", "Notification", "Stop", "SessionEnd"]
 
 
 def settings_path():
@@ -285,7 +467,7 @@ def install():
         if ev != "SessionEnd":
             h["async"] = True  # Claude wartet nicht auf den Buddy
         g = {"hooks": [h]}
-        if ev in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
+        if ev in ("PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest"):
             g["matcher"] = "*"
         groups.append(g)
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -404,6 +586,11 @@ if __name__ == "__main__":
         wifi()
     elif cmd == "find":
         find()
+    elif cmd == "bild":
+        from PIL import Image
+        secs = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+        ok = send_image(Image.open(sys.argv[2]), base(sys.argv[2]), secs)
+        print("ok" if ok else "Geraet nicht erreicht")
     elif cmd == "update":
         print("ok - der Buddy sucht jetzt nach einem Update" if send_line("U") else "Geraet nicht erreicht")
     elif cmd == "install":

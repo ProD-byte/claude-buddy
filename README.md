@@ -14,7 +14,7 @@ Im Leerlauf spielt er Jo-Jo, liest, gießt seine Pflanze (sie wächst mit jeder 
 1. **Firmware** über den Browser-Flasher auf der Seite oben aufspielen (Chrome oder Edge, USB-C).
 2. **PC:** Python installieren, [`buddy.py`](buddy.py) herunterladen, dann
    ```
-   pip install pyserial
+   pip install pyserial pillow
    python buddy.py install
    ```
    Das trägt Hooks in `~/.claude/settings.json` ein (eine Sicherung wird angelegt). Entfernen: `python buddy.py uninstall`.
@@ -36,8 +36,9 @@ Im Leerlauf spielt er Jo-Jo, liest, gießt seine Pflanze (sie wächst mit jeder 
 
 Im WLAN holt sich der Buddy neue Versionen nachts von selbst (abschaltbar in den Einstellungen, dort auch „Jetzt aktualisieren“ und die Sprache Deutsch/Englisch).
 Laufen mehrere Claude-Code-Sitzungen gleichzeitig, zeigen kleine Mini-Buddys oben die anderen Projekte; Fragen und Erlaubnisse haben immer Vorrang.
+Er erkennt `git commit`/`git push`, Bauen, Aufspielen, Tests (grün/rot), Löschen, Aufgabenlisten und zeigt Screenshots von Claude kurz als Polaroid (abschaltbar).
 
 ## English
 
 A little companion on the LILYGO T-Display-S3 that shows what Claude Code is doing. Flash the firmware from the page above,
-then run `pip install pyserial` and `python buddy.py install` on your PC. Display language German or English (settings). Over Wi-Fi it updates itself at night.
+then run `pip install pyserial pillow` and `python buddy.py install` on your PC. Display language German or English (settings). Over Wi-Fi it updates itself at night.

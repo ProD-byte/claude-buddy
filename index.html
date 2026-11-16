@@ -18,7 +18,7 @@ iframe{display:block;width:100%;height:1300px;border:0;margin-top:16px}
 </head>
 <body><main>
 <h1>Claude-Buddy</h1>
-<p class="mute"><span data-i="for">Zeigt auf dem LILYGO T-Display-S3, was Claude Code gerade macht.</span> · Build 3 ·
+<p class="mute"><span data-i="for">Zeigt auf dem LILYGO T-Display-S3, was Claude Code gerade macht.</span> · Build 4 ·
 <span data-i="inof">Inoffizielles Bastelprojekt, kein Produkt von Anthropic.</span></p>
 <div class="box">
 <h2 data-i="fh">⚡ Firmware</h2>
@@ -32,7 +32,7 @@ iframe{display:block;width:100%;height:1300px;border:0;margin-top:16px}
 <div class="box">
 <h2 data-i="ph">💻 PC einrichten</h2>
 <p data-i="pp">Python installieren, dann <a href="buddy.py" download>buddy.py</a> herunterladen und im selben Ordner ausführen:</p>
-<p><code>pip install pyserial</code><br><code>python buddy.py install</code></p>
+<p><code>pip install pyserial pillow</code><br><code>python buddy.py install</code></p>
 <p data-i="pp2">Das trägt Hooks in Claude Code ein. Jede neue Sitzung meldet dem Buddy dann, was sie gerade tut – per USB oder WLAN (<code>python buddy.py wifi</code> bzw. am Gerät beide Tasten 2 s halten). Testen: <code>python buddy.py demo</code>.</p>
 </div>
 <iframe id="sim" src="simulation.html" title="Claude-Buddy Simulation"></iframe>
