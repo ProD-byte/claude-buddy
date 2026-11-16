@@ -15,7 +15,9 @@ Aufrufe:
   python buddy.py install         Hooks in Claude Code eintragen (~/.claude/settings.json)
   python buddy.py uninstall       Hooks wieder entfernen
 
-Verbindung: zuerst USB (Espressif-Port), sonst WLAN (IP aus config.json, sonst claude-buddy.local).
+Verbindung: zuerst USB, sonst WLAN (IP aus config.json, sonst claude-buddy.local).
+Per USB bekommen alle angesteckten Buddys die Meldung: T-Display-S3 (Espressif-Port) und
+SenseCAP Watcher (zweiter Kanal seines CH342-Wandlers).
 Alle Befehle gehen auch per WLAN. Mit --wlan wird USB uebersprungen (zum Testen).
 """
 import json
@@ -26,6 +28,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG_FILE = os.path.join(HERE, "config.json")
 ESPRESSIF_VID = 0x303A
+CH342_VID, CH342_PID = 0x1A86, 0x55D2  # SenseCAP Watcher: Kanal x.2 = ESP32-S3 (x.0 ist der Kamera-Chip)
+SCAN_EVERY = 20  # s: so oft nach neu angesteckten Buddys suchen
 
 
 def load_cfg():
@@ -69,9 +73,70 @@ def open_port(port):
 def find_ports():
     try:
         from serial.tools import list_ports
-        return [p.device for p in list_ports.comports() if p.vid == ESPRESSIF_VID]
+        out = []
+        for p in list_ports.comports():
+            if p.vid == ESPRESSIF_VID:
+                out.append(p.device)
+            elif p.vid == CH342_VID and p.pid == CH342_PID and (p.location or "").endswith(".2"):
+                out.append(p.device)
+        return out
     except Exception:
         return []
+
+
+def usb_ports(cfg):
+    """Bekannte USB-Ports aller Buddys; sucht hoechstens alle SCAN_EVERY s neu (spart Zeit in den Hooks)."""
+    if FORCE_WLAN:
+        return []
+    ports = list(cfg.get("ports") or ([cfg["port"]] if cfg.get("port") else []))
+    if not ports or time.time() - cfg.get("scan_t", 0) > SCAN_EVERY:
+        ports = list(dict.fromkeys(find_ports()))
+        cfg["ports"] = ports
+        cfg["scan_t"] = time.time()
+        if ports:
+            cfg["port"] = ports[0]
+        save_cfg(cfg)
+    return ports
+
+
+def write_port(p, data, chunked=False):
+    """Schreibt data an einen Port; True wenn es geklappt hat."""
+    for _ in range(3):  # Port kann kurz von einem anderen Hook belegt sein
+        try:
+            s = open_port(p)
+            if chunked:
+                s.write_timeout = 3
+                for i in range(0, len(data), 2048):  # in Haeppchen, sonst laeuft der Empfangspuffer im Buddy ueber
+                    s.write(data[i:i + 2048])
+                    s.flush()
+                    time.sleep(0.03)
+            else:
+                s.write(data)
+                s.flush()
+            s.close()
+            return True
+        except Exception as e:
+            if "PermissionError" in repr(e) or "Zugriff" in str(e):
+                time.sleep(0.05)
+                continue
+            return False
+    return False
+
+
+def send_usb(data, chunked=False):
+    """An alle Buddys per USB; True wenn mindestens einer es bekommen hat."""
+    cfg = load_cfg()
+    ports = usb_ports(cfg)
+    ok = [p for p in ports if write_port(p, data, chunked)]
+    if len(ok) < len(ports) and not FORCE_WLAN:  # einer fehlt (abgesteckt?): gleich neu suchen
+        fresh = [p for p in find_ports() if p not in ports]
+        ok += [p for p in fresh if write_port(p, data, chunked)]
+        cfg["ports"] = ok
+        cfg["scan_t"] = time.time()
+        if ok:
+            cfg["port"] = ok[0]
+        save_cfg(cfg)
+    return bool(ok)
 
 
 FORCE_WLAN = "--wlan" in sys.argv  # zum Testen: USB auslassen
@@ -112,32 +177,9 @@ def http(path, data=None, timeout=0.6):
 
 def send_line(line):
     """Schickt eine Zeile; True wenn es geklappt hat."""
-    cfg = load_cfg()
     data = (line + "\n").encode("ascii", "replace")
-    ports = []
-    if cfg.get("port") and not FORCE_WLAN:
-        ports.append(cfg["port"])
-    for attempt in range(0 if FORCE_WLAN else 2):
-        for p in ports:
-            for _ in range(3):  # Port kann kurz von einem anderen Hook belegt sein
-                try:
-                    s = open_port(p)
-                    s.write(data)
-                    s.flush()
-                    s.close()
-                    if cfg.get("port") != p:
-                        cfg["port"] = p
-                        save_cfg(cfg)
-                    return True
-                except Exception as e:
-                    if "PermissionError" in repr(e) or "Zugriff" in str(e):
-                        time.sleep(0.05)
-                        continue
-                    break
-        if attempt == 0:
-            ports = [p for p in find_ports() if p not in ports]
-            if not ports:
-                break
+    if send_usb(data):
+        return True
     # WLAN
     import urllib.parse
     if line.startswith("S "):  # Zustand ueber /s (kennt auch aeltere Firmware)
@@ -177,25 +219,10 @@ def send_image(img, caption="", secs=0):
     except Exception:
         return False
     cap = ascii_only(caption, 38)
-    cfg = load_cfg()
-    ports = ([cfg["port"]] if cfg.get("port") else []) + find_ports()
-    for p in (dict.fromkeys(ports) if not (secs or FORCE_WLAN) else []):
-        for _ in range(3):
-            try:
-                s = open_port(p)
-                s.write_timeout = 3
-                data = ("P %d %d %s|" % (w, h, cap)).encode("ascii") + b64.encode("ascii") + b"\n"
-                for i in range(0, len(data), 2048):  # in Haeppchen, sonst laeuft der Empfangspuffer im Buddy ueber
-                    s.write(data[i:i + 2048])
-                    s.flush()
-                    time.sleep(0.03)
-                s.close()
-                return True
-            except Exception as e:
-                if "PermissionError" in repr(e) or "Zugriff" in str(e):
-                    time.sleep(0.05)
-                    continue
-                break
+    if not secs:
+        data = ("P %d %d %s|" % (w, h, cap)).encode("ascii") + b64.encode("ascii") + b"\n"
+        if send_usb(data, chunked=True):
+            return True
     import urllib.parse
     q = urllib.parse.urlencode({"w": w, "h": h, "c": cap, "s": int(secs)})
     return http("/img?" + q, data=b64.encode("ascii"), timeout=3) is not None
@@ -547,6 +574,19 @@ DEVICE_VERSION = "?"
 
 
 def find():
+    usb = [] if FORCE_WLAN else find_ports()
+    if len(usb) > 1:  # mehrere Buddys per USB: alle auflisten
+        cfg = load_cfg()
+        cfg["ports"], cfg["scan_t"] = usb, time.time()
+        save_cfg(cfg)
+        for p in usb:
+            cfg["port"] = p
+            save_cfg(cfg)
+            q, ip = query_device()
+            print("Buddy an %s, WLAN: %s, Firmware %s" % (p, ip, DEVICE_VERSION) if q == p else "%s antwortet nicht" % p)
+        cfg["port"] = usb[0]
+        save_cfg(cfg)
+        return
     port, ip = query_device()
     cfg = load_cfg()
     if port:
