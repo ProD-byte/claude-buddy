@@ -35,6 +35,13 @@ Aufrufe:
                                   auch Sprechen per Knopf (--sprache / --ohne-sprache)
   python buddy.py sprache [aus]   Sprechen per Watcher-Knopf einrichten: faster-whisper + Autostart (aus = entfernen)
   python buddy.py uninstall       Hooks (und Autostart) wieder entfernen
+  python buddy.py koppeln [ip] [--neu]  PC mit den Buddys koppeln (ohne Passwort): angesteckte per USB sofort,
+                                  die anderen per Knopfdruck am Geraet (Watcher: druecken, T-Display: IO14)
+  python buddy.py link            Browser-Adressen der Buddys mit Schluessel (z.B. fuer die SD-Seite)
+  python buddy.py flash <ip> <firmware.bin>  Firmware per WLAN aufspielen (pio run -e watcher-wlan -t upload)
+
+Sicherheit: Im WLAN nimmt ein Buddy Befehle nur von gekoppelten PCs an. Die Schluessel stehen in
+config.json ("kopplung"); geht etwas schief, koppelt buddy.py per USB oder Knopfdruck neu.
 
 Verbindung: zuerst USB, sonst WLAN (IP aus config.json, sonst claude-buddy.local).
 Alle Buddys bekommen die Meldung: angesteckte per USB (T-Display-S3 am Espressif-Port,
@@ -68,6 +75,232 @@ def save_cfg(cfg):
             json.dump(cfg, f, indent=2)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------- Kopplung (Schluessel statt Passwort)
+_TOK_CACHE = {"t": None, "map": {}}
+
+
+def _kopplung(cfg=None):
+    return (cfg if cfg is not None else load_cfg()).get("kopplung") or {}
+
+
+def token_for(host):
+    """Schluessel fuer eine Buddy-Adresse (config.json "kopplung" = {mac: {"token", "ip", "name"}})."""
+    try:
+        mt = os.path.getmtime(CFG_FILE)
+    except OSError:
+        return None
+    if _TOK_CACHE["t"] != mt:
+        _TOK_CACHE["t"] = mt
+        _TOK_CACHE["map"] = {v.get("ip"): v.get("token") for v in _kopplung().values() if isinstance(v, dict)}
+    return _TOK_CACHE["map"].get(host)
+
+
+def store_token(mac, token, ip, name=""):
+    cfg = load_cfg()
+    k = cfg.setdefault("kopplung", {})
+    for m in [m for m, v in k.items() if m != mac and v.get("ip") == ip]:
+        del k[m]  # andere Adresse gehoert jetzt diesem Geraet
+    k[mac] = {"token": token, "ip": ip, "name": name or (k.get(mac) or {}).get("name", "")}
+    save_cfg(cfg)
+    _TOK_CACHE["t"] = None
+
+
+def pc_name():
+    import socket
+    return ascii_only(socket.gethostname(), 23) or "PC"
+
+
+def usb_pair(port):
+    """Koppelt still ueber das USB-Kabel ("KP <name>" -> "TOKEN <hex> <mac>"). Liefert (token, mac) oder None."""
+    try:
+        s = open_port(port)
+        s.reset_input_buffer()
+        s.write(("KP %s\n" % pc_name()).encode("ascii"))
+        s.flush()
+        t, buf = time.time(), b""
+        while time.time() - t < 2:
+            buf += s.read(128)
+            if b"TOKEN " in buf and b"\n" in buf.split(b"TOKEN ", 1)[1]:
+                break
+        s.close()
+        txt = buf.decode("ascii", "replace")
+        if "TOKEN " not in txt:
+            return None
+        parts = txt.split("TOKEN ", 1)[1].splitlines()[0].split()
+        if len(parts) >= 2 and len(parts[0]) == 32:
+            return parts[0], parts[1]
+    except Exception:
+        pass
+    return None
+
+
+def _raw_get(url, timeout=2, token=None):
+    """GET ohne automatische Neu-Kopplung (fuer die Kopplung selbst)."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"X-Buddy-Token": token} if token else {})
+    req._buddy_retry = True
+    return urllib.request.urlopen(req, timeout=timeout).read().decode("ascii", "replace")
+
+
+def device_mac(host):
+    try:
+        m = _raw_get("http://%s/id" % host, 2).strip()
+        return m if len(m) == 17 else None
+    except Exception:
+        return None
+
+
+def paired_ok(host):
+    """True = gekoppelt (oder alte Firmware ohne Kopplung), False = Buddy will einen Schluessel."""
+    try:
+        return bool(json.loads(_raw_get("http://%s/pair?test=1" % host, 2, token_for(host))).get("ok"))
+    except Exception as e:
+        return getattr(e, "code", 0) == 404  # alte Firmware: kennt /pair nicht
+
+
+def repair_token(host):
+    """Nach "401 nicht gekoppelt": still reparieren. Neue IP-Adresse -> Schluessel ueber die MAC wiederfinden,
+    sonst per USB neu koppeln, wenn der Buddy gerade angesteckt ist. True = neuer Versuch lohnt sich."""
+    mac = device_mac(host)
+    if mac:
+        e = _kopplung().get(mac)
+        if e and e.get("ip") != host:
+            store_token(mac, e["token"], host)
+            return True
+    for port in ([] if FORCE_WLAN else find_ports()):
+        r = ask_port(port, 1.0)
+        if r and r[0] == host:
+            tm = usb_pair(port)
+            if tm:
+                store_token(tm[1], tm[0], host, "USB")
+                return True
+    return False
+
+
+def button_pair(host, wait=65, quiet=False):
+    """Kopplung per Knopfdruck: Buddy fragt "Koppeln?", am Geraet bestaetigen. True = gekoppelt."""
+    import urllib.parse
+    try:
+        r = json.loads(_raw_get("http://%s/pair?%s" % (host, urllib.parse.urlencode({"name": pc_name()})), 3))
+    except Exception as e:
+        if not quiet:
+            print("%s: Kopplung nicht moeglich (%s)" % (host, e))
+        return False
+    if not quiet:
+        print("%s fragt jetzt \"Koppeln?\" - am Watcher druecken (drehen = nein), am T-Display IO14 (IO0 = nein)." % host)
+    t = time.time()
+    while time.time() - t < wait:
+        time.sleep(1)
+        try:
+            st = json.loads(_raw_get("http://%s/pair?id=%s" % (host, r["id"]), 3))
+        except Exception:
+            continue
+        if st.get("st") == "ok":
+            store_token(st["mac"], st["token"], host, "Knopf")
+            if not quiet:
+                print("%s: gekoppelt." % host)
+            return True
+        if st.get("st") in ("nein", "weg"):
+            break
+    if not quiet:
+        print("%s: nicht gekoppelt." % host)
+    return False
+
+
+def _install_token_opener():
+    """Alle urllib-Aufrufe an Buddys bekommen ihren Schluessel; bei 401 wird einmal still neu gekoppelt."""
+    import urllib.request
+
+    class TokenHandler(urllib.request.BaseHandler):
+        handler_order = 400
+
+        def http_request(self, req):
+            t = token_for((req.host or "").split(":")[0])
+            if t and not req.has_header("X-buddy-token"):
+                req.add_unredirected_header("X-Buddy-Token", t)
+            return req
+
+        def http_error_401(self, req, fp, code, msg, hdrs):
+            if getattr(req, "_buddy_retry", False):
+                return None
+            req._buddy_retry = True
+            if not repair_token((req.host or "").split(":")[0]):
+                return None
+            req.unredirected_hdrs.pop("X-buddy-token", None)
+            return self.parent.open(req, timeout=req.timeout)
+
+    urllib.request.install_opener(urllib.request.build_opener(TokenHandler))
+
+
+_install_token_opener()
+
+
+def koppeln(args):
+    """Angesteckte Buddys per USB koppeln, die anderen per Knopfdruck."""
+    neu = "--neu" in args
+    ips = [a for a in args if a[:1].isdigit()]
+    cfg = load_cfg()
+    done = set()
+    if not ips:
+        for port in ([] if FORCE_WLAN else find_ports()):
+            r = ask_port(port, 1.5)
+            if not r:
+                print("%s antwortet nicht" % port)
+                continue
+            ip = r[0]
+            if ip != "-" and not neu and token_for(ip) and paired_ok(ip):
+                print("%s (%s): schon gekoppelt" % (port, ip))
+                done.add(ip)
+                continue
+            tm = usb_pair(port)
+            if tm:
+                store_token(tm[1], tm[0], ip if ip != "-" else "", "USB")
+                print("%s (%s): per USB gekoppelt" % (port, ip))
+                done.add(ip)
+            else:
+                print("%s: alte Firmware ohne Kopplung (%s)" % (port, r[1]))
+        cfg = load_cfg()
+        ips = [ip for ip in (cfg.get("devices") or {}) if ip not in done]
+        for v in _kopplung(cfg).values():
+            if v.get("ip") and v["ip"] not in done and v["ip"] not in ips:
+                ips.append(v["ip"])
+    for ip in ips:
+        if not neu and paired_ok(ip):
+            print("%s: schon gekoppelt" % ip)
+            continue
+        if device_mac(ip) is None and not neu:
+            print("%s antwortet nicht (oder alte Firmware)" % ip)
+            continue
+        button_pair(ip)
+
+
+def link():
+    for mac, v in _kopplung().items():
+        if v.get("ip"):
+            print("http://%s/sd?k=%s   (%s)" % (v["ip"], v["token"], mac))
+
+
+def flash(ip, binfile):
+    """Firmware per WLAN aufspielen (POST /update mit Schluessel)."""
+    import urllib.request
+    import uuid
+    data = open(binfile, "rb").read()
+    bnd = uuid.uuid4().hex
+    body = (("--%s\r\nContent-Disposition: form-data; name=\"firmware\"; filename=\"firmware.bin\"\r\n"
+             "Content-Type: application/octet-stream\r\n\r\n" % bnd).encode() + data + ("\r\n--%s--\r\n" % bnd).encode())
+    if not paired_ok(ip):
+        print("%s ist nicht gekoppelt - Kopplung per Knopfdruck ..." % ip)
+        if not button_pair(ip):
+            sys.exit(1)
+    req = urllib.request.Request("http://%s/update" % ip, data=body, headers={"Content-Type": "multipart/form-data; boundary=" + bnd})
+    print("lade %d KB auf %s ..." % (len(data) // 1024, ip))
+    try:
+        print(urllib.request.urlopen(req, timeout=180).read().decode("ascii", "replace"))
+    except Exception as e:
+        print("fehlgeschlagen: %s" % e)
+        sys.exit(1)
 
 
 def ascii_only(s, n=44):
@@ -427,9 +660,11 @@ def send_state(state, detail="", sid="", proj=""):
 READ_TOOLS = {"Read", "NotebookRead"}
 SEARCH_TOOLS = {"Grep", "Glob", "ToolSearch", "LS"}
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
-RUN_TOOLS = {"Bash", "PowerShell", "BashOutput", "Monitor"}
+RUN_TOOLS = {"Bash", "PowerShell", "BashOutput"}
+WAIT_TOOLS = {"Monitor", "TaskOutput", "ScheduleWakeup", "AwaitShell"}       # auf etwas im Hintergrund warten
+MSG_TOOLS = {"SendMessage", "ListAgents"}                                    # mit anderen Sitzungen/Helfern reden
 WEB_TOOLS = {"WebFetch", "WebSearch"}
-AGENT_TOOLS = {"Agent", "Task", "SendMessage"}
+AGENT_TOOLS = {"Agent", "Task"}
 ASK_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
 
 
@@ -443,6 +678,10 @@ TEST_RE = re.compile(r"\b(pytest|unittest|jest|vitest|mocha|ctest|go test|cargo 
 UPLOAD_RE = re.compile(r"(-t upload|--target upload|\besptool\b|arduino-cli upload|\bavrdude\b|idf\.py .*flash|\bpio run -e ota)")
 BUILD_RE = re.compile(r"\b(pio run|platformio run|npm run build|yarn build|pnpm build|make\b|cmake --build|cargo build|go build|tsc\b|vite build|webpack|gradle build|mvn package|dotnet build|gcc|g\+\+|pip install|npm install|npm ci)")
 DELETE_RE = re.compile(r"(^|[;&|]\s*)(rm|del|rmdir|rd|remove-item|git rm)\b")
+INSTALL_RE = re.compile(r"\b(pip3? install|python -m pip install|npm (i|install|ci)\b|yarn add|pnpm (add|install)|apt(-get)? install|winget install|choco install|brew install|cargo add|pio pkg install|platformio pkg install|gem install|go get)")
+DOWNLOAD_RE = re.compile(r"(\bcurl\b|\bwget\b|invoke-webrequest|\biwr\b|gh release download|\bgit clone\b|\bgit pull\b|\bgit fetch\b)")
+WAIT_RE = re.compile(r"^(sleep|start-sleep|timeout)\b")
+IMAGE_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp|bmp)$", re.I)
 
 
 def command_kind(cmd):
@@ -454,12 +693,18 @@ def command_kind(cmd):
         return "push"
     if TEST_RE.search(c):
         return "test"
+    if INSTALL_RE.search(c):
+        return "install"
     if UPLOAD_RE.search(c):
         return "upload"
     if BUILD_RE.search(c):
         return "build"
     if DELETE_RE.search(c):
         return "delete"
+    if WAIT_RE.search(c):
+        return "waitbg"
+    if DOWNLOAD_RE.search(c):
+        return "download"
     return "run"
 
 
@@ -487,10 +732,18 @@ def line_diff(name, inp):
 def tool_state(name, inp):
     inp = inp or {}
     if name in READ_TOOLS:
-        return "read", base(inp.get("file_path") or inp.get("notebook_path"))
+        f = inp.get("file_path") or inp.get("notebook_path") or ""
+        if IMAGE_EXT_RE.search(str(f)):
+            return "look", base(f)  # ein Bild ansehen
+        return "read", base(f)
     if name in WRITE_TOOLS:
         d = line_diff(name, inp)
-        return "write", (base(inp.get("file_path") or inp.get("notebook_path")) + ("  " + d if d else ""))
+        st = "write" if name == "Write" else "edit"  # neu schreiben oder vorhandene Datei aendern
+        return st, (base(inp.get("file_path") or inp.get("notebook_path")) + ("  " + d if d else ""))
+    if name in WAIT_TOOLS:
+        return "waitbg", inp.get("description") or ""
+    if name in MSG_TOOLS:
+        return "msg", inp.get("to") or inp.get("summary") or ""
     if name in ("Bash", "PowerShell"):
         cmd = inp.get("command") or ""
         kind = command_kind(cmd)
@@ -514,7 +767,11 @@ def tool_state(name, inp):
         parts = name.split("__")
         tool = parts[-1]
         if "browser" in name.lower() or "chrome" in name.lower():
-            return "web", tool
+            return "browser", inp.get("url") and __import__("urllib.parse").parse.urlparse(inp["url"]).netloc or tool
+        if "ccd_session" in name or "send_message" in tool:
+            return "msg", inp.get("title") or ""
+        if tool == "update_plan":
+            return "plan", ""
         return "run", tool
     if name == "TodoWrite":
         todos = inp.get("todos") or []
@@ -692,6 +949,40 @@ def maybe_throw(sid):
         pass
 
 
+def plan_progress(sid, name, inp):
+    """(erledigt, gesamt) der Aufgabenliste, wenn sich etwas aendert; je Sitzung in config.json gemerkt."""
+    items = None
+    if name == "TodoWrite":
+        items = [t.get("status") for t in inp.get("todos") or [] if isinstance(t, dict)]
+    elif name.endswith("update_plan"):
+        if inp.get("items"):
+            items = [t.get("status") for t in inp["items"] if isinstance(t, dict)]
+        else:
+            cfg = load_cfg()
+            plan = (cfg.get("plaene") or {}).get(sid)
+            if not plan:
+                return None
+            done, total = plan
+            if inp.get("advance"):
+                done += 1
+            done += len(inp.get("done") or [])
+            done = min(done, total)
+            cfg.setdefault("plaene", {})[sid] = [done, total]
+            save_cfg(cfg)
+            return done, total
+    if items is None:
+        return None
+    done, total = sum(1 for x in items if x == "completed"), len(items)
+    cfg = load_cfg()
+    pl = cfg.setdefault("plaene", {})
+    pl[sid] = [done, total]
+    if len(pl) > 20:  # alte Sitzungen vergessen
+        for k in list(pl)[:-20]:
+            del pl[k]
+    save_cfg(cfg)
+    return done, total
+
+
 def handle_hook():
     try:
         ev = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
@@ -717,6 +1008,12 @@ def handle_hook():
     elif name == "PreToolUse":
         st, d = tool_state(ev.get("tool_name", ""), ev.get("tool_input"))
         send(st, d)
+        try:
+            pr = plan_progress(sid, ev.get("tool_name", ""), ev.get("tool_input") or {})
+            if pr:
+                send_line("PR %d/%d" % pr)
+        except Exception:
+            pass
     elif name == "PostToolUse":
         tool, inp = ev.get("tool_name", ""), ev.get("tool_input") or {}
         if tool in ("Bash", "PowerShell") and command_kind(inp.get("command")) == "test":
@@ -1518,6 +1815,7 @@ def zuhoeren(args):
     threading.Thread(target=extras_loop, daemon=True).start()  # Wetter + Plaudereien
     host, last_id, last_find = None, None, 0
     polls, beat, last_st, trace_until, fails, wx_asked = 0, 0, 0, 0, 0, 0
+    pair_asked = 0
     while True:
         try:
             if not host or time.time() - last_find > 60:
@@ -1563,6 +1861,11 @@ def zuhoeren(args):
         except KeyboardInterrupt:
             return
         except Exception as e:  # WLAN-Aussetzer (z.B. Hand ueber der Antenne) oder Watcher startet neu
+            if getattr(e, "code", 0) == 401 and host and time.time() - pair_asked > 600:
+                pair_asked = time.time()
+                zlog("Watcher %s ist nicht gekoppelt - frage per Knopfdruck" % host)
+                zlog("gekoppelt" if button_pair(host, quiet=True) else "nicht gekoppelt (python buddy.py koppeln)")
+                continue
             fails += 1
             if fails <= 3 or fails % 20 == 0:
                 zlog("Fehler (%d): %s" % (fails, e))
@@ -1702,6 +2005,12 @@ if __name__ == "__main__":
         save_cfg(c)
         maybe_throw("test-neu")
         print("geworfen")
+    elif cmd == "koppeln":
+        koppeln(sys.argv[2:])
+    elif cmd == "link":
+        link()
+    elif cmd == "flash":
+        flash(sys.argv[2], sys.argv[3])
     elif cmd == "zuhoeren":
         zuhoeren(sys.argv[2:])
     elif cmd == "protokoll":
