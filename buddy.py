@@ -21,8 +21,17 @@ Aufrufe:
   python buddy.py zeitraffer holen [serie]  neueste (oder genannte) Serie laden und als GIF speichern
   python buddy.py ton [<name> <datei.wav>|<name> weg]  eigenen Ton hochladen/entfernen (ohne: Liste)
   python buddy.py protokoll       letzte Arbeitsrunden und Summe von heute
-  python buddy.py install         Hooks in Claude Code eintragen (~/.claude/settings.json)
-  python buddy.py uninstall       Hooks wieder entfernen
+  python buddy.py sag <text>      den Watcher etwas sagen lassen (Windows-Stimme, offline); nach jeder Runde liest er
+                                  Claudes Ergebnis in einem Satz vor (am Watcher: Einstellungen -> Vorlesen)
+  python buddy.py frage <text>    Freigabe am Watcher-Knopf testen (druecken = ja, drehen = nein); im Betrieb fragt der
+                                  PermissionRequest-Hook so, 20 s lang (config.json: "freigabe_sek", 0 = aus)
+  python buddy.py wurf            Ball von einem Buddy zum anderen werfen (passiert sonst beim Sitzungswechsel)
+  python buddy.py zuhoeren [--ohne-enter]  laeuft dauerhaft: Knopf am Watcher halten und sprechen -> Text wird
+                                  offline erkannt (faster-whisper) und ins aktive Fenster eingefuegt + Enter
+  python buddy.py install         Hooks in Claude Code eintragen (~/.claude/settings.json); mit Watcher auf Wunsch
+                                  auch Sprechen per Knopf (--sprache / --ohne-sprache)
+  python buddy.py sprache [aus]   Sprechen per Watcher-Knopf einrichten: faster-whisper + Autostart (aus = entfernen)
+  python buddy.py uninstall       Hooks (und Autostart) wieder entfernen
 
 Verbindung: zuerst USB, sonst WLAN (IP aus config.json, sonst claude-buddy.local).
 Alle Buddys bekommen die Meldung: angesteckte per USB (T-Display-S3 am Espressif-Port,
@@ -513,6 +522,173 @@ def tool_state(name, inp):
     return "think", name
 
 
+# ----------------------------------------------------------------- Vorlesen, Freigabe am Knopf, Ball werfen
+def tts_wav(text):
+    """Text -> WAV-Bytes (16 kHz, mono, 16 Bit) mit der Windows-Stimme (offline, System.Speech)."""
+    import subprocess
+    import tempfile
+    d = tempfile.gettempdir()
+    tp, wp = os.path.join(d, "buddy-sag.txt"), os.path.join(d, "buddy-sag.wav")
+    with open(tp, "w", encoding="utf-8") as f:
+        f.write(text)
+    stimme = load_cfg().get("stimme", "Microsoft Hedda Desktop")
+    ps = ("Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+          "try { $s.SelectVoice('%s') } catch {}; $s.Rate = 1; "
+          "$f = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, "
+          "[System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono); "
+          "$s.SetOutputToWaveFile('%s', $f); $s.Speak([IO.File]::ReadAllText('%s', [Text.Encoding]::UTF8)); $s.Dispose()") % (stimme, wp, tp)
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, timeout=20,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return loud_wav(wp)
+
+
+def loud_wav(path, drive=2.2):
+    """WAV voll aussteuern und sanft verdichten (der kleine Lautsprecher braucht Pegel, leise Silben werden hoerbar)."""
+    import array
+    import io
+    import math
+    import wave
+    with wave.open(path, "rb") as w:
+        par = w.getparams()
+        a = array.array("h")
+        a.frombytes(w.readframes(w.getnframes()))
+    peak = max((abs(x) for x in a), default=0) or 1
+    k = math.tanh(drive)
+    out = array.array("h", (int(math.tanh(drive * x / peak) / k * 31500) for x in a))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setparams(par)
+        w.writeframes(out.tobytes())
+    return buf.getvalue()
+
+
+def say(text):
+    """Laesst den Watcher einen Satz sprechen (wenn "Vorlesen" an ist)."""
+    import urllib.request
+    text = (text or "").strip()
+    if not text or not load_cfg().get("vorlesen", True):
+        return False
+    host = watcher_host()
+    if not host:
+        return False
+    wav = tts_wav(text)
+    bnd = "----buddysay%d" % int(time.time() * 1000)
+    body = (("--%s\r\nContent-Disposition: form-data; name=\"f\"; filename=\"sag.wav\"\r\n"
+             "Content-Type: audio/wav\r\n\r\n") % bnd).encode() + wav + ("\r\n--%s--\r\n" % bnd).encode()
+    req = urllib.request.Request("http://%s/say" % host, data=body, headers={"Content-Type": "multipart/form-data; boundary=" + bnd})
+    try:
+        return urllib.request.urlopen(req, timeout=10).read().startswith(b"ok")
+    except Exception:
+        return False
+
+
+def last_answer(ev):
+    """Letzte Antwort von Claude (Text) aus dem Hook bzw. dem Gespraechsprotokoll."""
+    t = ev.get("last_assistant_message")
+    if isinstance(t, str) and t.strip():
+        return t
+    p = ev.get("transcript_path")
+    if not p or not os.path.exists(p):
+        return ""
+    try:
+        with open(p, encoding="utf-8") as f:
+            lines = f.readlines()[-200:]
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        m = e.get("message") or {}
+        if e.get("type") != "assistant" or m.get("role") != "assistant":
+            continue
+        c = m.get("content")
+        txt = c if isinstance(c, str) else " ".join(b.get("text", "") for b in (c or []) if isinstance(b, dict) and b.get("type") == "text")
+        if txt.strip():
+            return txt
+    return ""
+
+
+def speakable(text, n=220):
+    """Ersten Satz (oder zwei kurze) einer Antwort fuer die Sprachausgabe aufbereiten."""
+    import re
+    t = re.sub(r"```.*?```", " ", text, flags=re.S)
+    t = re.sub(r"`([^`]*)`", r"\1", t)
+    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)
+    t = re.sub(r"https?://\S+", "", t)
+    t = re.sub(r"[*_#>|]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    out = ""
+    for s in re.split(r"(?<=[.!?])\s+", t):
+        if len(out) + len(s) > n and out:
+            break
+        out += (" " if out else "") + s
+        if len(out) > 60:
+            break
+    return out[:n]
+
+
+def ask_knob(text, wait=None):
+    """Freigabe am Watcher erfragen: 'allow', 'deny' oder None (keiner hat geantwortet / kein Watcher)."""
+    import random
+    import urllib.parse
+    import urllib.request
+    wait = load_cfg().get("freigabe_sek", 20) if wait is None else wait
+    if not wait:
+        return None
+    host = watcher_host()
+    if not host:
+        return None
+    fid = random.randint(1, 999999)
+    try:
+        urllib.request.urlopen("http://%s/cmd?%s" % (host, urllib.parse.urlencode({"l": "F %d|%s" % (fid, ascii_only(text, 70))})), timeout=3).read()
+    except Exception:
+        return None
+    t = time.time()
+    while time.time() - t < wait:
+        time.sleep(0.3)
+        try:
+            st = json.loads(urllib.request.urlopen("http://%s/frage" % host, timeout=2).read())
+        except Exception:
+            continue
+        if st.get("id") == fid and st.get("a") in (1, 2):
+            return "allow" if st["a"] == 1 else "deny"
+    try:  # niemand hat geantwortet: Frage zurueckziehen, Claude fragt dann am PC
+        urllib.request.urlopen("http://%s/cmd?l=F%%200" % host, timeout=2).read()
+    except Exception:
+        pass
+    return None
+
+
+def maybe_throw(sid):
+    """Wechselt die Arbeit zu einer anderen Claude-Sitzung, wirft ein Buddy dem anderen einen Ball zu (Ping-Pong)."""
+    import urllib.request
+    cfg = load_cfg()
+    now = time.time()
+    last, last_t = cfg.get("wurf_sid"), cfg.get("wurf_t", 0)
+    if sid == last:
+        if now - last_t > 30:
+            cfg["wurf_t"] = now
+            save_cfg(cfg)
+        return
+    cfg["wurf_sid"], cfg["wurf_t"] = sid, now
+    devs = sorted((cfg.get("devices") or {}).keys())
+    if not last or now - last_t > 600 or now - cfg.get("wurf_zuletzt", 0) < 15 or len(devs) < 2:
+        save_cfg(cfg)
+        return
+    von = cfg.get("wurf_von") if cfg.get("wurf_von") in devs else devs[0]
+    zu = next(d for d in devs if d != von)
+    cfg["wurf_von"], cfg["wurf_zuletzt"] = zu, now  # naechstes Mal andersherum
+    save_cfg(cfg)
+    try:
+        urllib.request.urlopen("http://%s/cmd?l=Y%%201" % von, timeout=2).read()
+        time.sleep(0.75)  # Ball fliegt aus dem einen Bild ...
+        urllib.request.urlopen("http://%s/cmd?l=Y%%202" % zu, timeout=2).read()  # ... und ins andere
+    except Exception:
+        pass
+
+
 def handle_hook():
     try:
         ev = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
@@ -526,6 +702,11 @@ def handle_hook():
 
     def send(st, d=""):
         send_state(st, d, sid, cwd)
+    if name in ("SessionStart", "UserPromptSubmit"):
+        try:
+            maybe_throw(sid)
+        except Exception:
+            pass
     if name == "SessionStart":
         send("hello")
     elif name == "UserPromptSubmit":
@@ -549,8 +730,19 @@ def handle_hook():
         else:
             send("oops", tool)  # Befehl ist fehlgeschlagen: kurzer Schreck
     elif name == "PermissionRequest":
-        st, d = tool_state(ev.get("tool_name", ""), ev.get("tool_input"))
+        tool = ev.get("tool_name", "")
+        st, d = tool_state(tool, ev.get("tool_input"))
         send("need", d)  # zeigt, wofuer Claude die Erlaubnis braucht
+        try:  # am Watcher-Knopf beantworten lassen (sonst normale Abfrage am PC)
+            ans = ask_knob("%s: %s" % (tool, d) if d else tool)
+        except Exception:
+            ans = None
+        if ans:
+            dec = {"behavior": ans}
+            if ans == "deny":
+                dec["message"] = "Am Claude-Buddy (Watcher) abgelehnt."
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": dec}}))
+            send("think")
     elif name == "PreCompact":
         send("compact")
     elif name == "Notification":
@@ -564,6 +756,10 @@ def handle_hook():
             send("need")
     elif name == "Stop":
         send("done")
+        try:  # Ergebnis in einem Satz vorlesen (Watcher)
+            say(speakable(last_answer(ev)))
+        except Exception:
+            pass
     elif name == "SessionEnd":
         send("bye")
     # Hooks duerfen Claude nie aufhalten
@@ -600,15 +796,54 @@ def settings_path():
     return os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
 
 
-def install():
+AUTOSTART = os.path.join(os.environ.get("APPDATA") or "", "Microsoft", "Windows", "Start Menu", "Programs", "Startup",
+                         "claude-buddy-zuhoeren.vbs")
+
+
+def sprache(args=()):
+    """Sprechen per Watcher-Knopf einrichten: faster-whisper installieren, Zuhoeren in den Autostart legen und starten."""
+    import subprocess
+    try:
+        import faster_whisper  # noqa: F401
+        print("faster-whisper ist da.")
+    except ImportError:
+        print("Installiere faster-whisper (Spracherkennung, offline) ...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "faster-whisper"], check=False)
+    if os.name != "nt":
+        print("Autostart gibt es nur unter Windows - bitte  python buddy.py zuhoeren  selbst starten.")
+        return
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.exists(pyw):
+        pyw = sys.executable
+    me = os.path.abspath(__file__)
+    vbs = ('\' Claude-Buddy: Sprechen per Watcher-Knopf (startet unsichtbar mit Windows)\r\n'
+           'CreateObject("WScript.Shell").Run """%s"" ""%s"" zuhoeren", 0, False\r\n') % (pyw, me)
+    os.makedirs(os.path.dirname(AUTOSTART), exist_ok=True)
+    with open(AUTOSTART, "w", encoding="utf-16") as f:  # VBS mit Umlauten im Pfad: UTF-16
+        f.write(vbs)
+    print("Autostart eingerichtet:", AUTOSTART)
+    if "--nicht-starten" not in args:
+        subprocess.Popen(["wscript", AUTOSTART])
+        print("Zuhoeren laeuft (Protokoll: %s)." % os.path.join(LOG_DIR, "zuhoeren.log"))
+    print("Am Watcher: Knopf halten und sprechen - der Text landet im aktiven Fenster.")
+
+
+def sprache_aus():
+    if os.path.exists(AUTOSTART):
+        os.remove(AUTOSTART)
+        print("Autostart entfernt. (Ein laufendes Zuhoeren endet mit dem naechsten Neustart.)")
+
+
+def install(args=()):
     """Traegt die Hooks fuer alle Claude-Code-Sitzungen ein (bestehende Einstellungen bleiben erhalten)."""
     p = settings_path()
     data = {}
     if os.path.exists(p):
         with open(p, encoding="utf-8") as f:
             data = json.load(f)
-        with open(p + ".vor-buddy", "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        if not os.path.exists(p + ".vor-buddy"):  # nur einmal: der Stand von vor dem Buddy
+            with open(p + ".vor-buddy", "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
     me = os.path.abspath(__file__).replace("\\", "/")
     py = "python" if os.name == "nt" else "python3"
     cmd = '%s "%s" hook' % (py, me)
@@ -617,8 +852,12 @@ def install():
         groups = hooks.setdefault(ev, [])
         groups[:] = [g for g in groups if not any("buddy.py" in h.get("command", "") for h in g.get("hooks", []))]
         h = {"type": "command", "command": cmd, "timeout": 5}
-        if ev != "SessionEnd":
+        if ev == "PermissionRequest":  # wartet auf die Antwort am Watcher-Knopf (danach normale Abfrage)
+            h["timeout"] = 35
+        elif ev != "SessionEnd":
             h["async"] = True  # Claude wartet nicht auf den Buddy
+            if ev in ("Stop", "SessionStart", "UserPromptSubmit"):
+                h["timeout"] = 25  # Vorlesen bzw. Ball werfen braucht etwas laenger
         g = {"hooks": [h]}
         if ev in ("PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest"):
             g["matcher"] = "*"
@@ -632,6 +871,15 @@ def install():
         import serial  # noqa: F401
     except ImportError:
         print("Hinweis: Fuer USB bitte noch  pip install pyserial  ausfuehren (WLAN geht auch ohne).")
+    # Sprechen per Knopf gibt es nur beim SenseCAP Watcher (hat ein Mikrofon)
+    want = "--sprache" in args
+    if not want and "--ohne-sprache" not in args and (himax_port() or watcher_host()):
+        try:
+            want = input("SenseCAP Watcher gefunden. Sprechen per Knopf einrichten (Autostart)? [J/n] ").strip().lower() in ("", "j", "ja", "y")
+        except EOFError:
+            want = False
+    if want:
+        sprache(args)
 
 
 def uninstall():
@@ -650,6 +898,7 @@ def uninstall():
     with open(p, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     print("Buddy-Hooks entfernt.")
+    sprache_aus()
 
 
 def query_device():
@@ -1057,6 +1306,166 @@ def protokoll(n=15):
     print("Heute: %d Runden, %d:%02d h" % (len(t), sum(t) // 3600, sum(t) // 60 % 60))
 
 
+# ----------------------------------------------------------------- Sprechen (Watcher-Knopf halten)
+# Der Watcher nimmt auf, solange der Knopf gehalten wird. "zuhoeren" fragt /rec ab, holt /rec.wav,
+# erkennt den Text offline mit faster-whisper und fuegt ihn ins aktive Fenster ein (+ Enter).
+LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "claude-buddy")
+WHISPER_MODEL = "small"
+WHISPER_HINT = "Claude, Claude Code, Buddy, Watcher, ESP32, T-Display, PlatformIO, GitHub, Commit, Push, Firmware, Python."
+
+
+def zlog(msg):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    line = time.strftime("%H:%M:%S ") + msg
+    print(line, flush=True)
+    try:
+        with open(os.path.join(LOG_DIR, "zuhoeren.log"), "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d ") + line + "\n")
+    except OSError:
+        pass
+
+
+def clip_get():
+    import ctypes
+    from ctypes import wintypes
+    u, k = ctypes.windll.user32, ctypes.windll.kernel32
+    u.GetClipboardData.restype = wintypes.HANDLE
+    u.GetClipboardData.argtypes = [wintypes.UINT]
+    k.GlobalLock.restype = wintypes.LPVOID
+    k.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    k.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    u.OpenClipboard.argtypes = [wintypes.HWND]
+    if not u.OpenClipboard(None):
+        return None
+    try:
+        h = u.GetClipboardData(13)  # CF_UNICODETEXT
+        if not h:
+            return None
+        p = k.GlobalLock(h)
+        txt = ctypes.wstring_at(p) if p else None
+        k.GlobalUnlock(h)
+        return txt
+    finally:
+        u.CloseClipboard()
+
+
+def clip_set(text):
+    import ctypes
+    from ctypes import wintypes
+    u, k = ctypes.windll.user32, ctypes.windll.kernel32
+    k.GlobalAlloc.restype = wintypes.HGLOBAL
+    k.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    k.GlobalLock.restype = wintypes.LPVOID
+    k.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    k.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    u.OpenClipboard.argtypes = [wintypes.HWND]
+    u.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    u.SetClipboardData.restype = wintypes.HANDLE
+    data = (text + "\0").encode("utf-16-le")
+    for _ in range(10):
+        if u.OpenClipboard(None):
+            break
+        time.sleep(0.05)
+    else:
+        return False
+    try:
+        u.EmptyClipboard()
+        h = k.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
+        p = k.GlobalLock(h)
+        ctypes.memmove(p, data, len(data))
+        k.GlobalUnlock(h)
+        u.SetClipboardData(13, h)
+        return True
+    finally:
+        u.CloseClipboard()
+
+
+def type_text(text, enter=True):
+    """Text ueber die Zwischenablage ins aktive Fenster einfuegen (Strg+V), optional Enter; alte Zwischenablage zurueck."""
+    import ctypes
+    kb = ctypes.windll.user32.keybd_event
+    old = clip_get()
+    if not clip_set(text):
+        return False
+    time.sleep(0.05)
+    kb(0x11, 0, 0, 0)          # Strg
+    kb(0x56, 0, 0, 0)          # V
+    kb(0x56, 0, 2, 0)
+    kb(0x11, 0, 2, 0)
+    if enter:
+        time.sleep(0.25)
+        kb(0x0D, 0, 0, 0)      # Enter
+        kb(0x0D, 0, 2, 0)
+    time.sleep(0.4)
+    if old is not None:
+        clip_set(old)
+    return True
+
+
+def transcribe(model, wav):
+    """WAV-Bytes (16 kHz, mono, 16 Bit vom Watcher) -> Text. Liest die WAV selbst (ohne PyAV)."""
+    import io
+    import wave
+    import numpy as np
+    with wave.open(io.BytesIO(wav), "rb") as w:
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
+    if len(pcm) < 1600:
+        return ""
+    segs, _ = model.transcribe(pcm, language="de", beam_size=5, vad_filter=True, initial_prompt=WHISPER_HINT)
+    return " ".join(s.text.strip() for s in segs).strip()
+
+
+def zuhoeren(args):
+    """Laeuft dauerhaft: Sprachaufnahmen vom Watcher holen, erkennen, einfuegen."""
+    import socket
+    import tempfile
+    import urllib.parse
+    import urllib.request
+    try:  # nur einmal gleichzeitig
+        lock = socket.socket()
+        lock.bind(("127.0.0.1", 47811))
+    except OSError:
+        print("zuhoeren laeuft schon.")
+        return
+    enter = load_cfg().get("sprache_enter", True) and "--ohne-enter" not in args
+    zlog("lade Spracherkennung (%s) ..." % WHISPER_MODEL)
+    from faster_whisper import WhisperModel
+    model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    zlog("bereit - Knopf am Watcher halten und sprechen")
+    host, last_id, last_find = None, None, 0
+    while True:
+        try:
+            if not host or time.time() - last_find > 60:
+                h = watcher_host()
+                last_find = time.time()
+                if h and h != host:
+                    zlog("Watcher: %s" % h)
+                host = h or host
+                if not host:
+                    time.sleep(3)
+                    continue
+            st = json.loads(urllib.request.urlopen("http://%s/rec" % host, timeout=2).read())
+            if last_id is None:
+                last_id = st["id"]  # alte Aufnahme beim Start nicht noch einmal verarbeiten
+            if st["st"] == 2 and st["id"] != last_id:
+                last_id = st["id"]
+                wav = urllib.request.urlopen("http://%s/rec.wav" % host, timeout=10).read()
+                t0 = time.time()
+                text = transcribe(model, wav)
+                zlog("erkannt in %.1f s (%.1f s Ton): %s" % (time.time() - t0, st["ms"] / 1000, text or "-"))
+                show = ascii_only(text, 66)
+                urllib.request.urlopen("http://%s/cmd?%s" % (host, urllib.parse.urlencode({"l": "R " + show if show else "R"})), timeout=3).read()
+                if text:
+                    type_text(text, enter)
+            time.sleep(0.35)
+        except KeyboardInterrupt:
+            return
+        except Exception as e:  # Watcher kurz weg (Neustart, WLAN): weiter versuchen
+            zlog("Fehler: %s" % e)
+            host = None
+            time.sleep(3)
+
+
 def foto_save(jpg, show=True, rotate=None):
     """JPEG speichern (ggf. gedreht), letztes.jpg aktualisieren, alte aufraeumen, als Polaroid zeigen."""
     os.makedirs(FOTO_DIR, exist_ok=True)
@@ -1138,12 +1547,29 @@ if __name__ == "__main__":
         zeitraffer(sys.argv[2:])
     elif cmd == "ton":
         ton(sys.argv[2:])
+    elif cmd == "sag":  # Watcher etwas sagen lassen (Test der Stimme)
+        print("ok" if say(" ".join(sys.argv[2:]) or "Hallo, ich bin dein Claude-Buddy.") else "nicht geklappt (Watcher im WLAN? Vorlesen an?)")
+    elif cmd == "frage":  # Freigabe am Knopf testen
+        print(ask_knob(" ".join(sys.argv[2:]) or "Bash: echo Test") or "keine Antwort")
+    elif cmd == "wurf":  # Ball werfen testen (braucht zwei Buddys im WLAN)
+        c = load_cfg()
+        c["wurf_sid"], c["wurf_t"], c["wurf_zuletzt"] = "test-alt", time.time(), 0
+        save_cfg(c)
+        maybe_throw("test-neu")
+        print("geworfen")
+    elif cmd == "zuhoeren":
+        zuhoeren(sys.argv[2:])
     elif cmd == "protokoll":
         protokoll()
     elif cmd == "update":
         print("ok - der Buddy sucht jetzt nach einem Update" if send_line("U") else "Geraet nicht erreicht")
     elif cmd == "install":
-        install()
+        install(sys.argv[2:])
+    elif cmd == "sprache":
+        if sys.argv[2:3] == ["aus"]:
+            sprache_aus()
+        else:
+            sprache(sys.argv[2:])
     elif cmd == "uninstall":
         uninstall()
     else:
