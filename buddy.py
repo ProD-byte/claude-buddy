@@ -12,12 +12,22 @@ Aufrufe:
   python buddy.py find            Geraet suchen, Verbindung pruefen
   python buddy.py bild <datei> [s] Bild als Polaroid zeigen, optional s Sekunden (braucht pillow)
   python buddy.py update          Buddy sofort nach neuer Firmware suchen lassen
+  python buddy.py foto [240|416|480|640] [--drehen 90|180|270 [--merken]] [--still] [--an]
+                                  Foto mit der Kamera des SenseCAP Watchers (USB, sonst WLAN), gibt den Dateipfad aus.
+                                  Liegt in %LOCALAPPDATA%\\claude-buddy\\fotos (letztes.jpg = neuestes).
+                                  --still: nicht auf dem Buddy zeigen, --an: Kamera 2 min anlassen
+  SD-Karte des Watchers (ueber WLAN, Uebersicht im Browser: http://<ip>/sd):
+  python buddy.py zeitraffer <sek>|aus   Zeitraffer auf die SD-Karte starten/stoppen (ohne Angabe: Stand)
+  python buddy.py zeitraffer holen [serie]  neueste (oder genannte) Serie laden und als GIF speichern
+  python buddy.py ton [<name> <datei.wav>|<name> weg]  eigenen Ton hochladen/entfernen (ohne: Liste)
+  python buddy.py protokoll       letzte Arbeitsrunden und Summe von heute
   python buddy.py install         Hooks in Claude Code eintragen (~/.claude/settings.json)
   python buddy.py uninstall       Hooks wieder entfernen
 
 Verbindung: zuerst USB, sonst WLAN (IP aus config.json, sonst claude-buddy.local).
-Per USB bekommen alle angesteckten Buddys die Meldung: T-Display-S3 (Espressif-Port) und
-SenseCAP Watcher (zweiter Kanal seines CH342-Wandlers).
+Alle Buddys bekommen die Meldung: angesteckte per USB (T-Display-S3 am Espressif-Port,
+SenseCAP Watcher am zweiten Kanal seines CH342), alle anderen bekannten per WLAN.
+Welche WLAN-Adresse zu welchem USB-Port gehoert, merkt sich config.json ("devices").
 Alle Befehle gehen auch per WLAN. Mit --wlan wird USB uebersprungen (zum Testen).
 """
 import json
@@ -84,6 +94,38 @@ def find_ports():
         return []
 
 
+def ask_port(p, wait=1.0):
+    """Fragt einen Buddy per USB nach seiner WLAN-Adresse: "BUDDY <ip oder -> v<version>". Liefert (ip, version) oder None."""
+    try:
+        s = open_port(p)
+        s.reset_input_buffer()
+        s.write(b"?\n")
+        s.flush()
+        t = time.time()
+        buf = b""
+        while time.time() - t < wait:
+            buf += s.read(64)
+            if b"BUDDY" in buf and b"\n" in buf.split(b"BUDDY", 1)[1]:
+                break
+        s.close()
+        txt = buf.decode("ascii", "replace")
+        if "BUDDY" not in txt:
+            return None
+        parts = txt.split("BUDDY", 1)[1].splitlines()[0].split()
+        return (parts[0] if parts else "-"), (parts[1] if len(parts) > 1 else "v1")
+    except Exception:
+        return None
+
+
+def learn_device(cfg, port, ip):
+    """Merkt sich, welche WLAN-Adresse zu welchem USB-Port gehoert (cfg["devices"] = {ip: port})."""
+    devs = cfg.setdefault("devices", {})
+    for k in [k for k, v in devs.items() if v == port and k != ip]:
+        del devs[k]  # Port hat jetzt eine andere Adresse
+    if ip and ip != "-":
+        devs[ip] = port
+
+
 def usb_ports(cfg):
     """Bekannte USB-Ports aller Buddys; sucht hoechstens alle SCAN_EVERY s neu (spart Zeit in den Hooks)."""
     if FORCE_WLAN:
@@ -95,6 +137,15 @@ def usb_ports(cfg):
         cfg["scan_t"] = time.time()
         if ports:
             cfg["port"] = ports[0]
+        # neue Buddys nach ihrer WLAN-Adresse fragen (ohne Adresse hoechstens alle 5 min erneut)
+        known = set((cfg.get("devices") or {}).values())
+        asked = cfg.setdefault("asked", {})
+        for p in ports:
+            if p not in known and time.time() - asked.get(p, 0) > 300:
+                asked[p] = time.time()
+                r = ask_port(p, 0.8)
+                if r:
+                    learn_device(cfg, p, r[0])
         save_cfg(cfg)
     return ports
 
@@ -124,7 +175,7 @@ def write_port(p, data, chunked=False):
 
 
 def send_usb(data, chunked=False):
-    """An alle Buddys per USB; True wenn mindestens einer es bekommen hat."""
+    """An alle Buddys per USB; liefert die Liste der Ports, die es bekommen haben."""
     cfg = load_cfg()
     ports = usb_ports(cfg)
     ok = [p for p in ports if write_port(p, data, chunked)]
@@ -136,7 +187,66 @@ def send_usb(data, chunked=False):
         if ok:
             cfg["port"] = ok[0]
         save_cfg(cfg)
-    return bool(ok)
+    return ok
+
+
+def wlan_targets(cfg, reached):
+    """WLAN-Adressen der bekannten Buddys, die gerade nicht per USB erreicht wurden.
+    Wer zuletzt nicht antwortete, wird 60 s lang uebersprungen (damit die Hooks nicht warten)."""
+    devs = dict(cfg.get("devices") or {})
+    if not devs and cfg.get("host"):  # alte config.json: nur eine Adresse
+        devs = {cfg["host"]: cfg.get("port")}
+    down = cfg.get("down") or {}
+    return [ip for ip, port in devs.items() if port not in reached and time.time() - down.get(ip, 0) > 60]
+
+
+def http_multi(hosts, path, data=None, timeout=0.8):
+    """Ruft path bei mehreren Buddys gleichzeitig auf; liefert die Liste der Adressen, die geantwortet haben."""
+    import threading
+    import urllib.request
+    ok, lock = [], threading.Lock()
+
+    def one(h):
+        try:
+            req = urllib.request.Request("http://%s%s" % (h, path), data=data,
+                                         headers={"Content-Type": "text/plain"} if data else {})
+            urllib.request.urlopen(req, timeout=timeout).read()
+            with lock:
+                ok.append(h)
+        except Exception:
+            pass
+
+    th = [threading.Thread(target=one, args=(h,)) for h in hosts]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    if len(ok) < len(hosts):  # Nicht-Antworter merken
+        cfg = load_cfg()
+        down = cfg.setdefault("down", {})
+        for h in hosts:
+            if h in ok:
+                down.pop(h, None)
+            else:
+                down[h] = time.time()
+        save_cfg(cfg)
+    elif hosts:
+        cfg = load_cfg()
+        if any(h in (cfg.get("down") or {}) for h in hosts):
+            for h in hosts:
+                cfg["down"].pop(h, None)
+            save_cfg(cfg)
+    return ok
+
+
+def line_path(line):
+    """HTTP-Pfad fuer eine Befehlszeile."""
+    import urllib.parse
+    if line.startswith("S "):  # Zustand ueber /s (kennt auch aeltere Firmware)
+        f = line[2:].split("|")
+        f += [""] * (5 - len(f))
+        return "/s?" + urllib.parse.urlencode({"st": f[0], "d": f[1], "t": f[2], "sid": f[3], "p": f[4]})
+    return "/cmd?" + urllib.parse.urlencode({"l": line})  # alle anderen Befehle (ab v5)
 
 
 FORCE_WLAN = "--wlan" in sys.argv  # zum Testen: USB auslassen
@@ -178,16 +288,16 @@ def http(path, data=None, timeout=0.6):
 def send_line(line):
     """Schickt eine Zeile; True wenn es geklappt hat."""
     data = (line + "\n").encode("ascii", "replace")
-    if send_usb(data):
+    reached = send_usb(data)
+    # WLAN: alle bekannten Buddys, die gerade nicht am USB haengen
+    cfg = load_cfg()
+    hosts = wlan_targets(cfg, reached)
+    path = line_path(line)
+    if hosts:
+        return bool(http_multi(hosts, path, timeout=0.8 if line.startswith("S ") else 2)) or bool(reached)
+    if reached:
         return True
-    # WLAN
-    import urllib.parse
-    if line.startswith("S "):  # Zustand ueber /s (kennt auch aeltere Firmware)
-        f = line[2:].split("|")
-        f += [""] * (5 - len(f))
-        q = urllib.parse.urlencode({"st": f[0], "d": f[1], "t": f[2], "sid": f[3], "p": f[4]})
-        return http("/s?" + q) is not None
-    return http("/cmd?" + urllib.parse.urlencode({"l": line}), timeout=2) is not None  # alle anderen Befehle (ab v5)
+    return http(path, timeout=0.6 if line.startswith("S ") else 2) is not None  # noch keine Adresse bekannt: mDNS
 
 
 # ----------------------------------------------------------------- Screenshots als Polaroid
@@ -219,12 +329,17 @@ def send_image(img, caption="", secs=0):
     except Exception:
         return False
     cap = ascii_only(caption, 38)
+    reached = []
     if not secs:
         data = ("P %d %d %s|" % (w, h, cap)).encode("ascii") + b64.encode("ascii") + b"\n"
-        if send_usb(data, chunked=True):
-            return True
+        reached = send_usb(data, chunked=True)
     import urllib.parse
     q = urllib.parse.urlencode({"w": w, "h": h, "c": cap, "s": int(secs)})
+    hosts = wlan_targets(load_cfg(), reached)
+    if hosts:
+        return bool(http_multi(hosts, "/img?" + q, data=b64.encode("ascii"), timeout=3)) or bool(reached)
+    if reached:
+        return True
     return http("/img?" + q, data=b64.encode("ascii"), timeout=3) is not None
 
 
@@ -574,18 +689,36 @@ DEVICE_VERSION = "?"
 
 
 def find():
+    """Alle Buddys suchen: per USB (und deren WLAN-Adresse merken), dann die bekannten, die nur im WLAN sind."""
+    cfg = load_cfg()
     usb = [] if FORCE_WLAN else find_ports()
-    if len(usb) > 1:  # mehrere Buddys per USB: alle auflisten
-        cfg = load_cfg()
-        cfg["ports"], cfg["scan_t"] = usb, time.time()
-        save_cfg(cfg)
-        for p in usb:
-            cfg["port"] = p
-            save_cfg(cfg)
-            q, ip = query_device()
-            print("Buddy an %s, WLAN: %s, Firmware %s" % (p, ip, DEVICE_VERSION) if q == p else "%s antwortet nicht" % p)
-        cfg["port"] = usb[0]
-        save_cfg(cfg)
+    seen = set()
+    for p in usb:
+        r = ask_port(p, 1.5)
+        if r:
+            learn_device(cfg, p, r[0])
+            seen.add(r[0])
+            print("Buddy an %s, WLAN: %s, Firmware %s" % (p, r[0], r[1]))
+        else:
+            print("%s antwortet nicht" % p)
+    if usb:
+        cfg["ports"], cfg["scan_t"], cfg["port"] = usb, time.time(), usb[0]
+    devs = dict(cfg.get("devices") or {})
+    if not devs and cfg.get("host"):
+        devs = {cfg["host"]: cfg.get("port")}
+    for ip in devs:
+        if ip in seen:
+            continue
+        import urllib.request
+        try:
+            txt = urllib.request.urlopen("http://%s/cmd?l=%%3F" % ip, timeout=1.5).read().decode("ascii", "replace")
+            print("Buddy per WLAN %s (zuletzt an %s), Firmware %s" % (ip, devs[ip] or "?", txt.split()[-1] if txt.startswith("BUDDY") else "?"))
+            seen.add(ip)
+        except Exception:
+            print("%s (zuletzt an %s) antwortet nicht" % (ip, devs[ip] or "?"))
+    cfg.pop("down", None)
+    save_cfg(cfg)
+    if seen or usb:
         return
     port, ip = query_device()
     cfg = load_cfg()
@@ -620,6 +753,340 @@ def wifi():
     print("Noch keine Verbindung - Name/Passwort pruefen (nur 2,4-GHz-WLAN).")
 
 
+# ----------------------------------------------------------------- Kamera (SenseCAP Watcher)
+# Die Kamera haengt am KI-Chip Himax WE2. Der ist ueber den anderen Kanal des CH342 direkt am PC
+# (SSCMA-AT-Befehle, 921600 Baud); der Buddy schaltet nur seinen Strom ("K 1" / "K 0").
+# Fotos bleiben lokal (nicht im synchronisierten Projektordner), die letzten FOTO_MAX werden behalten.
+FOTO_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "claude-buddy", "fotos")
+FOTO_MAX = 30
+FOTO_RES = {"240": 0, "416": 1, "480": 2, "640": 3}
+
+
+def himax_port():
+    """COM-Port des Kamerachips: der Kanal des Watcher-CH342, der nicht der ESP32 ist."""
+    try:
+        from serial.tools import list_ports
+        for p in list_ports.comports():
+            if p.vid == CH342_VID and p.pid == CH342_PID and not (p.location or "").endswith(".2"):
+                return p.device
+    except Exception:
+        pass
+    return None
+
+
+def himax_cmd(s, c, wait=3.0, until_image=False):
+    """Schickt einen AT-Befehl und sammelt die JSON-Antworten (je Zeile eine)."""
+    s.reset_input_buffer()
+    s.write((c + "\r\n").encode())
+    t, buf, msgs = time.time(), b"", []
+    while time.time() - t < wait:
+        buf += s.read(1 << 16)
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.strip()
+            if line.startswith(b"{"):
+                try:
+                    msgs.append(json.loads(line))
+                except Exception:
+                    pass
+        if msgs and not until_image:
+            break
+        if until_image and any(isinstance(m.get("data"), dict) and m["data"].get("image") for m in msgs):
+            break
+    return msgs
+
+
+def foto_wlan(res="640", keep_on=False):
+    """Foto ueber WLAN: der Watcher holt das Bild selbst per SPI vom Kamerachip (ab Firmware v8).
+    Liefert die JPEG-Bytes oder None."""
+    import urllib.request
+    cfg = load_cfg()
+    hosts = list((cfg.get("devices") or {}).keys()) or ([cfg["host"]] if cfg.get("host") else [])
+    r = FOTO_RES.get(str(res), 3)
+    for ip in hosts:
+        try:  # das T-Display kennt /foto nicht (404) - dann den naechsten Buddy fragen
+            urllib.request.urlopen("http://%s/foto?r=%d%s" % (ip, r, "&an=1" if keep_on else ""), timeout=2).read()
+        except Exception:
+            continue
+        t = time.time()
+        while time.time() - t < 25:
+            time.sleep(0.4)
+            try:
+                return urllib.request.urlopen("http://%s/foto.jpg" % ip, timeout=5).read()
+            except urllib.error.HTTPError as e:
+                if e.code == 503:  # nimmt noch auf
+                    continue
+                print("Watcher %s: %s" % (ip, e.read().decode("utf-8", "replace")))
+                return None
+            except Exception:
+                continue
+        print("Watcher %s: keine Antwort" % ip)
+        return None
+    return None
+
+
+def foto(res="640", keep_on=False, show=True, rotate=None):
+    """Foto mit der Watcher-Kamera (per USB direkt vom Kamerachip, sonst ueber WLAN); liefert den Dateipfad oder None."""
+    import base64
+    port = None if FORCE_WLAN else himax_port()
+    if not port:
+        import urllib.error  # noqa: F401
+        jpg = foto_wlan(res, keep_on)
+        if not jpg:
+            print("Kein Foto: Watcher weder per USB noch per WLAN erreichbar.")
+            return None
+        return foto_save(jpg, show, rotate)
+    import serial
+    s = serial.Serial()
+    s.port, s.baudrate, s.timeout = port, 921600, 0.1
+    s.dtr = False
+    s.rts = False
+    try:
+        s.open()
+    except Exception as e:
+        print("Kamera-Port %s nicht frei: %s" % (port, e))
+        return None
+    jpg = None
+    try:
+        # Laeuft der Chip schon? Sonst einschalten und den Start abwarten: Der Bootloader geht in den
+        # X-Modem-Flashmodus, wenn in den ersten 100 ms ein Zeichen kommt - also erst still mitlesen.
+        if not any(m.get("name") == "ID?" for m in himax_cmd(s, "AT+ID?", 0.6)):
+            send_line("K 1")
+            t, last, got = time.time(), time.time(), False
+            while time.time() - t < 8:
+                b = s.read(4096)
+                if b:
+                    got, last = True, time.time()
+                elif got and time.time() - last > 1.0:
+                    break  # Startmeldung ist durch
+        t = time.time()
+        while time.time() - t < 12:  # nach dem Einschalten braucht der Chip ein paar Sekunden
+            if any(m.get("name") == "ID?" for m in himax_cmd(s, "AT+ID?", 0.8)):
+                break
+        else:
+            print("Kamerachip antwortet nicht.")
+            return None
+        himax_cmd(s, "AT+SENSOR=1,1,%d" % FOTO_RES.get(str(res), 3), 3)
+        for m in himax_cmd(s, "AT+SAMPLE=1", 8, until_image=True):
+            d = m.get("data")
+            if isinstance(d, dict) and d.get("image"):
+                jpg = base64.b64decode(d["image"])
+    finally:
+        s.close()
+        if not keep_on:
+            send_line("K 0")
+    if not jpg:
+        print("Kein Bild bekommen.")
+        return None
+    sd_put("fotos/%s.jpg" % time.strftime("%Y-%m-%d_%H-%M-%S"), jpg, timeout=3)  # auch ins SD-Fotoarchiv (wenn im WLAN)
+    return foto_save(jpg, show, rotate)
+
+
+# ----------------------------------------------------------------- SD-Karte des Watchers (ueber WLAN)
+def watcher_host():
+    """WLAN-Adresse des Buddys mit SD-Karte (der Watcher); None wenn keiner antwortet."""
+    import urllib.request
+    cfg = load_cfg()
+    for ip in list((cfg.get("devices") or {}).keys()) or ([cfg["host"]] if cfg.get("host") else []):
+        try:
+            with urllib.request.urlopen("http://%s/zeitraffer" % ip, timeout=1.5) as r:
+                if r.status == 200:
+                    return ip
+        except Exception:
+            continue
+    return None
+
+
+def sd_put(path, data, timeout=10, host=None):
+    """Datei auf die SD-Karte des Watchers schreiben (multipart-POST an /sdput)."""
+    import urllib.parse
+    import urllib.request
+    host = host or watcher_host()
+    if not host:
+        return False
+    bnd = "----buddy%d" % int(time.time() * 1000)
+    body = (("--%s\r\nContent-Disposition: form-data; name=\"f\"; filename=\"%s\"\r\n"
+             "Content-Type: application/octet-stream\r\n\r\n") % (bnd, os.path.basename(path))).encode() + data + ("\r\n--%s--\r\n" % bnd).encode()
+    req = urllib.request.Request("http://%s/sdput?%s" % (host, urllib.parse.urlencode({"p": path})), data=body,
+                                 headers={"Content-Type": "multipart/form-data; boundary=" + bnd})
+    try:
+        return urllib.request.urlopen(req, timeout=timeout).read().startswith(b"ok")
+    except Exception:
+        return False
+
+
+def sd_get(host, path, timeout=10):
+    import urllib.parse
+    import urllib.request
+    return urllib.request.urlopen("http://%s/sdget?%s" % (host, urllib.parse.urlencode({"p": path})), timeout=timeout).read()
+
+
+def sd_list(host, d=""):
+    import urllib.parse
+    import urllib.request
+    return json.loads(urllib.request.urlopen("http://%s/sdlist?%s" % (host, urllib.parse.urlencode({"d": d})), timeout=10).read())
+
+
+def zeitraffer(args):
+    """zeitraffer <sek> | aus | holen [serie] | (ohne: Stand)"""
+    import urllib.request
+    host = watcher_host()
+    if not host:
+        print("Watcher nicht im WLAN erreichbar.")
+        return
+    a = args[0] if args else ""
+    if a == "holen":
+        return zeitraffer_holen(host, args[1] if len(args) > 1 else None)
+    if a:
+        sec = 0 if a in ("aus", "0", "stop") else int(a)
+        try:
+            txt = urllib.request.urlopen("http://%s/zeitraffer?s=%d" % (host, sec), timeout=15).read()
+        except urllib.error.HTTPError as e:
+            txt = e.read()
+    else:
+        txt = urllib.request.urlopen("http://%s/zeitraffer" % host, timeout=5).read()
+    st = json.loads(txt)
+    if not st.get("sd"):
+        print("Keine SD-Karte im Watcher.")
+    elif st.get("an"):
+        print("Zeitraffer laeuft: alle %d s, %d Bilder bisher (%s)" % (st["sek"], st["bilder"], st["ordner"]))
+    else:
+        print("Zeitraffer aus. Letzte Serie: %s (%d Bilder)" % (st.get("ordner") or "-", st.get("bilder", 0)))
+
+
+def zeitraffer_holen(host, serie=None, fps=8, breite=480):
+    """Laedt eine Zeitraffer-Serie (Standard: die neueste) und macht daraus ein GIF; gibt den Pfad aus."""
+    from PIL import Image
+    import io
+    serien = sd_list(host, "zeitraffer").get("dirs", [])
+    if not serien:
+        print("Noch keine Zeitraffer-Serie auf der SD-Karte.")
+        return None
+    serie = serie or serien[0]  # neueste zuerst
+    files = sorted(f[0] for f in sd_list(host, "zeitraffer/" + serie).get("files", []) if f[0].endswith(".jpg"))
+    if not files:
+        print("Serie %s ist leer." % serie)
+        return None
+    out_dir = os.path.join(os.path.dirname(FOTO_DIR), "zeitraffer", serie)
+    os.makedirs(out_dir, exist_ok=True)
+    frames = []
+    for i, f in enumerate(files):
+        p = os.path.join(out_dir, f)
+        if not os.path.exists(p):
+            with open(p, "wb") as fh:
+                fh.write(sd_get(host, "zeitraffer/%s/%s" % (serie, f)))
+        img = Image.open(p).convert("RGB")
+        img.thumbnail((breite, breite))
+        frames.append(img)
+        print("\r%d/%d Bilder geladen" % (i + 1, len(files)), end="", flush=True)
+    print()
+    gif = os.path.join(os.path.dirname(out_dir), serie + ".gif")
+    frames[0].save(gif, save_all=True, append_images=frames[1:], duration=int(1000 / fps), loop=0, optimize=True)
+    print(gif)
+    return gif
+
+
+def ton(args):
+    """ton <name> <datei.wav> | ton <name> weg | ton (Liste)"""
+    import io
+    import wave
+    names = ["hello", "bye", "think", "read", "search", "write", "run", "web", "agent", "need", "ask", "done", "oops",
+             "poke", "mode", "remind", "whistle", "pop", "party", "commit", "push", "build", "upload", "test", "testok",
+             "testfail", "delete", "compact", "camera"]
+    host = watcher_host()
+    if not host:
+        print("Watcher nicht im WLAN erreichbar.")
+        return
+    if not args:
+        have = {f[0][:-4] for f in sd_list(host, "toene").get("files", []) if f[0].endswith(".wav")}
+        print("Eigene Toene (* = vorhanden):")
+        print("  " + "  ".join(("*" if n in have else "") + n for n in names))
+        return
+    name = args[0]
+    if name not in names:
+        print("Unbekannter Name. Moeglich: " + ", ".join(names))
+        return
+    if len(args) > 1 and args[1] in ("weg", "loeschen", "aus"):
+        import urllib.request
+        urllib.request.urlopen("http://%s/sddel?p=toene/%s.wav" % (host, name), timeout=5).read()
+        print("%s: wieder der eingebaute Ton" % name)
+        return
+    w = wave.open(args[1], "rb")
+    ch, sw, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+    data = w.readframes(min(w.getnframes(), rate * 10))  # hoechstens 10 s
+    w.close()
+    if ch > 2:
+        print("Bitte eine Mono- oder Stereo-WAV.")
+        return
+    if sw != 2:  # der Watcher kann nur 16 Bit; Kanaele und Abtastrate rechnet er selbst um
+        try:
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                import audioop
+            data = audioop.lin2lin(data, sw, 2)
+        except ImportError:
+            print("Bitte als 16-Bit-WAV speichern (diese hat %d Bit)." % (sw * 8))
+            return
+    buf = io.BytesIO()
+    o = wave.open(buf, "wb")
+    o.setnchannels(ch)
+    o.setsampwidth(2)
+    o.setframerate(rate)
+    o.writeframes(data)
+    o.close()
+    ok = sd_put("toene/%s.wav" % name, buf.getvalue(), host=host)
+    print("%s: %s" % (name, "hochgeladen, ab jetzt aktiv" if ok else "Hochladen fehlgeschlagen"))
+
+
+def protokoll(n=15):
+    """Letzte Runden aus dem Arbeitsprotokoll und die Summe von heute."""
+    host = watcher_host()
+    if not host:
+        print("Watcher nicht im WLAN erreichbar.")
+        return
+    try:
+        rows = [r.split(";") for r in sd_get(host, "protokoll.csv").decode("utf-8", "replace").splitlines()[1:] if r.strip()]
+    except Exception:
+        print("Noch kein Protokoll.")
+        return
+    for r in rows[-n:]:
+        print("%s %s-%s  %3d min  %s" % (r[0], r[1], r[2], int(r[3]) // 60, r[4] if len(r) > 4 else ""))
+    heute = time.strftime("%Y-%m-%d")
+    t = [int(r[3]) for r in rows if r[0] == heute]
+    print("Heute: %d Runden, %d:%02d h" % (len(t), sum(t) // 3600, sum(t) // 60 % 60))
+
+
+def foto_save(jpg, show=True, rotate=None):
+    """JPEG speichern (ggf. gedreht), letztes.jpg aktualisieren, alte aufraeumen, als Polaroid zeigen."""
+    os.makedirs(FOTO_DIR, exist_ok=True)
+    path = os.path.join(FOTO_DIR, time.strftime("foto-%Y%m%d-%H%M%S.jpg"))
+    rotate = load_cfg().get("foto_drehen", 0) if rotate is None else rotate
+    img = None
+    if rotate or show:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(jpg))
+        if rotate:
+            img = img.rotate(-rotate, expand=True)  # im Uhrzeigersinn
+    if rotate:
+        img.save(path, quality=92)
+    else:
+        with open(path, "wb") as f:
+            f.write(jpg)
+    import shutil
+    shutil.copy(path, os.path.join(FOTO_DIR, "letztes.jpg"))
+    old = sorted(f for f in os.listdir(FOTO_DIR) if f.startswith("foto-"))
+    for f in old[:-FOTO_MAX]:
+        try:
+            os.remove(os.path.join(FOTO_DIR, f))
+        except OSError:
+            pass
+    if show and img is not None:
+        send_image(img, "Foto")  # kurz als Polaroid auf den Buddys (mit Ausloese-Geraeusch)
+    return path
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "hook"
     if cmd == "hook":
@@ -651,6 +1118,28 @@ if __name__ == "__main__":
         secs = int(sys.argv[3]) if len(sys.argv) > 3 else 0
         ok = send_image(Image.open(sys.argv[2]), base(sys.argv[2]), secs)
         print("ok" if ok else "Geraet nicht erreicht")
+    elif cmd == "foto":
+        args = sys.argv[2:]
+        res = next((a for a in args if a in FOTO_RES), "640")
+        rot = None
+        if "--drehen" in args:
+            i = args.index("--drehen")
+            rot = int(args[i + 1]) if i + 1 < len(args) else 180
+            if "--merken" in args:
+                c = load_cfg()
+                c["foto_drehen"] = rot
+                save_cfg(c)
+        p = foto(res, keep_on="--an" in args, show="--still" not in args, rotate=rot)
+        if p:
+            print(p)
+        else:
+            sys.exit(1)
+    elif cmd == "zeitraffer":
+        zeitraffer(sys.argv[2:])
+    elif cmd == "ton":
+        ton(sys.argv[2:])
+    elif cmd == "protokoll":
+        protokoll()
     elif cmd == "update":
         print("ok - der Buddy sucht jetzt nach einem Update" if send_line("U") else "Geraet nicht erreicht")
     elif cmd == "install":
