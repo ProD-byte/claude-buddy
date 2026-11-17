@@ -217,7 +217,7 @@ def button_pair(host, wait=65, quiet=False):
             print("%s: Kopplung nicht moeglich (%s)" % (host, e))
         return False
     if not quiet:
-        print("%s fragt jetzt \"Koppeln?\" - am Watcher druecken (drehen = nein), am T-Display IO14 (IO0 = nein)." % host)
+        print("%s fragt jetzt \"Koppeln?\" - Watcher: druecken (drehen = nein), AMOLED: PWR (BOOT = nein), T-Display: IO14 (IO0 = nein)." % host)
     t = time.time()
     while time.time() - t < wait:
         time.sleep(1)
@@ -840,22 +840,93 @@ def tool_state(name, inp):
 
 
 # ----------------------------------------------------------------- Vorlesen, Freigabe am Knopf, Ball werfen
-def tts_wav(text):
-    """Text -> WAV-Bytes (16 kHz, mono, 16 Bit) mit der Windows-Stimme (offline, System.Speech)."""
+# Stimmen: die neueren Windows-Stimmen (WinRT/OneCore) klingen natuerlicher und es gibt Mann und Frau.
+# Fehlen sie, wird die klassische Stimme (System.Speech, z.B. Hedda) genommen.
+VOICES = {"frau": "Microsoft Katja", "mann": "Microsoft Stefan"}
+VOICE_LABEL = {"frau": "Frau (Katja)", "mann": "Mann (Stefan)"}
+WINRT_TTS = r"""
+param([string]$TextFile, [string]$OutFile, [string]$Voice, [double]$Rate)
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+[void][Windows.Media.SpeechSynthesis.SpeechSynthesizer, Windows.Media.SpeechSynthesis, ContentType = WindowsRuntime]
+[void][Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType = WindowsRuntime]
+$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+  $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Await($op, [Type]$t) { $task = $asTask.MakeGenericMethod($t).Invoke($null, @($op)); $task.Wait(-1) | Out-Null; $task.Result }
+$s = New-Object Windows.Media.SpeechSynthesis.SpeechSynthesizer
+$v = [Windows.Media.SpeechSynthesis.SpeechSynthesizer]::AllVoices | Where-Object { $_.DisplayName -eq $Voice } | Select-Object -First 1
+if (-not $v) { exit 3 }
+$s.Voice = $v
+try { $s.Options.SpeakingRate = $Rate } catch {}
+$text = [IO.File]::ReadAllText($TextFile, [Text.Encoding]::UTF8)
+$stream = Await ($s.SynthesizeTextToStreamAsync($text)) ([Windows.Media.SpeechSynthesis.SpeechSynthesisStream])
+$r = New-Object Windows.Storage.Streams.DataReader($stream.GetInputStreamAt(0))
+[void](Await ($r.LoadAsync([uint32]$stream.Size)) ([uint32]))
+$b = New-Object byte[] ([int]$stream.Size)
+$r.ReadBytes($b)
+[IO.File]::WriteAllBytes($OutFile, $b)
+"""
+
+
+def voice_for(host=None):
+    """"frau" oder "mann": je Buddy (config "stimmen" {ip: art}), sonst die allgemeine Wahl (config "stimme_art")."""
+    cfg = load_cfg()
+    return (cfg.get("stimmen") or {}).get(host) or cfg.get("stimme_art", "frau")
+
+
+def to16k_mono(path):
+    """WAV-Datei in 16 kHz, mono, 16 Bit umrechnen (so spielt sie der Buddy)."""
+    import wave
+    import numpy as np
+    with wave.open(path, "rb") as w:
+        ch, sw, sr, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+        raw = w.readframes(n)
+    if sw != 2:
+        return False
+    x = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+    if ch > 1:
+        x = x.reshape(-1, ch).mean(axis=1)
+    if sr != 16000 and len(x):
+        t = np.arange(0, len(x) / sr, 1 / 16000.0)
+        x = np.interp(t, np.arange(len(x)) / sr, x)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(np.clip(x, -32768, 32767).astype("<i2").tobytes())
+    return True
+
+
+def tts_wav(text, art=None):
+    """Text -> WAV-Bytes (16 kHz, mono, 16 Bit), offline mit einer Windows-Stimme. art: "frau" / "mann"."""
     import subprocess
     import tempfile
     d = tempfile.gettempdir()
     tp, wp = os.path.join(d, "buddy-sag.txt"), os.path.join(d, "buddy-sag.wav")
     with open(tp, "w", encoding="utf-8") as f:
         f.write(text)
-    stimme = load_cfg().get("stimme", "Microsoft Hedda Desktop")
+    nowin = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    art = art or voice_for()
+    try:  # neuere Windows-Stimmen (Mann/Frau)
+        ps1 = os.path.join(d, "buddy-tts.ps1")
+        with open(ps1, "w", encoding="utf-8-sig") as f:
+            f.write(WINRT_TTS)
+        if os.path.exists(wp):
+            os.remove(wp)
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ps1,
+                            "-TextFile", tp, "-OutFile", wp, "-Voice", VOICES.get(art, VOICES["frau"]), "-Rate", "1.05"],
+                           capture_output=True, timeout=30, creationflags=nowin)
+        if r.returncode == 0 and os.path.exists(wp) and os.path.getsize(wp) > 2000 and to16k_mono(wp):
+            return loud_wav(wp)
+    except Exception:
+        pass
+    stimme = load_cfg().get("stimme", "Microsoft Hedda Desktop")  # klassische Stimme als Rueckfall
     ps = ("Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
           "try { $s.SelectVoice('%s') } catch {}; $s.Rate = 1; "
           "$f = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, "
           "[System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono); "
           "$s.SetOutputToWaveFile('%s', $f); $s.Speak([IO.File]::ReadAllText('%s', [Text.Encoding]::UTF8)); $s.Dispose()") % (stimme, wp, tp)
     subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, timeout=20,
-                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                   creationflags=nowin)
     return loud_wav(wp)
 
 
@@ -880,23 +951,55 @@ def loud_wav(path, drive=2.2):
 
 
 def say(text):
-    """Laesst den Watcher einen Satz sprechen (wenn "Vorlesen" an ist)."""
+    """Laesst alle Buddys mit Lautsprecher (Watcher, AMOLED) einen Satz sprechen (wenn "Vorlesen" an ist)."""
+    import threading
     import urllib.request
     text = (text or "").strip()
     if not text or not load_cfg().get("vorlesen", True):
         return False
-    host = watcher_host()
-    if not host:
+    hosts = mic_hosts()  # wer ein Mikrofon hat, hat auch einen Lautsprecher
+    if not hosts:
         return False
-    wav = tts_wav(text)
+    wavs = {}
+    for h in hosts:  # jeder Buddy mit seiner Stimme; gleiche Stimmen nur einmal erzeugen
+        art = voice_for(h)
+        if art not in wavs:
+            wavs[art] = tts_wav(text, art)
+    ok = []
+
+    def one(h):
+        wav = wavs[voice_for(h)]
+        bnd = "----buddysay%d" % int(time.time() * 1000)
+        body = (("--%s\r\nContent-Disposition: form-data; name=\"f\"; filename=\"sag.wav\"\r\n"
+                 "Content-Type: audio/wav\r\n\r\n") % bnd).encode() + wav + ("\r\n--%s--\r\n" % bnd).encode()
+        req = urllib.request.Request("http://%s/say" % h, data=body, headers={"Content-Type": "multipart/form-data; boundary=" + bnd})
+        try:
+            if urllib.request.urlopen(req, timeout=10).read().startswith(b"ok"):
+                ok.append(h)
+        except Exception:
+            pass
+    th = [threading.Thread(target=one, args=(h,)) for h in hosts]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    return bool(ok)
+
+
+def say_on(host, text, art=None):
+    """Einen Satz auf genau einem Buddy sprechen (Probe der Stimme, Gespraeche). Liefert die Dauer in s oder 0."""
+    import urllib.request
+    wav = tts_wav(text, art or voice_for(host))
     bnd = "----buddysay%d" % int(time.time() * 1000)
     body = (("--%s\r\nContent-Disposition: form-data; name=\"f\"; filename=\"sag.wav\"\r\n"
              "Content-Type: audio/wav\r\n\r\n") % bnd).encode() + wav + ("\r\n--%s--\r\n" % bnd).encode()
     req = urllib.request.Request("http://%s/say" % host, data=body, headers={"Content-Type": "multipart/form-data; boundary=" + bnd})
     try:
-        return urllib.request.urlopen(req, timeout=10).read().startswith(b"ok")
+        if urllib.request.urlopen(req, timeout=10).read().startswith(b"ok"):
+            return max(0.0, (len(wav) - 44) / 32000.0)
     except Exception:
-        return False
+        pass
+    return 0
 
 
 def last_answer(ev):
@@ -1511,6 +1614,28 @@ def ask_wlan(ip, timeout=1.5):
     return (parts[2] if len(parts) > 2 else "?"), board
 
 
+def get_options(ip, timeout=4):
+    """Einstellungen eines Buddys (ab Firmware mit Befehl "O") als dict, None wenn nicht erreichbar/zu alt."""
+    import urllib.request
+    try:
+        txt = urllib.request.urlopen("http://%s/cmd?l=O" % ip, timeout=timeout).read().decode("utf-8", "replace")
+        return json.loads(txt) if txt.startswith("{") else None
+    except Exception:
+        return None
+
+
+def set_options(ip, **kv):
+    """Einstellungen setzen, z.B. set_options(ip, vol=3, lcd=4). Liefert die neuen Werte (dict) oder None."""
+    import urllib.parse
+    import urllib.request
+    line = "O " + ",".join("%s=%d" % (k, int(v)) for k, v in kv.items())
+    try:
+        txt = urllib.request.urlopen("http://%s/cmd?%s" % (ip, urllib.parse.urlencode({"l": line})), timeout=4).read().decode()
+        return json.loads(txt) if txt.startswith("{") else None
+    except Exception:
+        return None
+
+
 def mic_hosts():
     """WLAN-Adressen aller Buddys mit Mikrofon (Watcher, AMOLED): die beantworten /rec."""
     import urllib.request
@@ -1985,7 +2110,17 @@ def foto_save(jpg, show=True, rotate=None):
     """JPEG speichern (ggf. gedreht), letztes.jpg aktualisieren, alte aufraeumen, als Polaroid zeigen."""
     os.makedirs(FOTO_DIR, exist_ok=True)
     path = os.path.join(FOTO_DIR, time.strftime("foto-%Y%m%d-%H%M%S.jpg"))
-    rotate = load_cfg().get("foto_drehen", 0) if rotate is None else rotate
+    if rotate is None:
+        # Die Kamera sitzt fest im Watcher: ist sein Display gedreht (Einbaulage), das Foto genauso drehen.
+        # Dazu kommt eine von Hand gemerkte Korrektur (foto --drehen .. --merken).
+        rotate = load_cfg().get("foto_drehen", 0)
+        try:
+            host = watcher_host()
+            o = get_options(host, 3) if host else None
+            if o and o.get("rot"):
+                rotate = (rotate + 90 * int(o["rot"])) % 360
+        except Exception:
+            pass
     img = None
     if rotate or show:
         from PIL import Image
