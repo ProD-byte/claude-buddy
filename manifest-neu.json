@@ -1,6 +1,6 @@
 {
   "name": "Claude-Buddy (Neuinstallation)",
-  "version": "12",
+  "version": "13",
   "new_install_prompt_erase": false,
   "builds": [
     {

@@ -55,7 +55,8 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CFG_FILE = os.path.join(HERE, "config.json")
+DATA = os.environ.get("CLAUDE_BUDDY_DATA") or HERE  # das Windows-Programm setzt %LOCALAPPDATA%\ClaudeBuddy
+CFG_FILE = os.path.join(DATA, "config.json")
 ESPRESSIF_VID = 0x303A
 CH342_VID, CH342_PID = 0x1A86, 0x55D2  # SenseCAP Watcher: Kanal x.2 = ESP32-S3 (x.0 ist der Kamera-Chip)
 SCAN_EVERY = 20  # s: so oft nach neu angesteckten Buddys suchen
@@ -80,7 +81,7 @@ def save_cfg(cfg):
 # ---------------------------------------------------------------- Kopplung (Schluessel statt Passwort)
 # Eigene Datei, nur beim Koppeln geschrieben: config.json schreiben die Hooks staendig, eine alte Kopie
 # koennte sonst einen frischen Schluessel wieder ueberschreiben.
-KOPPL_FILE = os.path.join(HERE, "kopplung.json")
+KOPPL_FILE = os.path.join(DATA, "kopplung.json")
 _TOK_CACHE = {"t": None, "map": {}}
 
 
@@ -374,6 +375,10 @@ def find_ports():
         return []
 
 
+BOARDS = {}  # Port oder IP -> Geraeteart aus der Antwort auf "?" ("watcher", "amoled", "tdisplay")
+BOARD_LABEL = {"watcher": "SenseCAP Watcher", "amoled": "AMOLED 1.75C", "tdisplay": "T-Display-S3"}
+
+
 def ask_port(p, wait=1.0):
     """Fragt einen Buddy per USB nach seiner WLAN-Adresse: "BUDDY <ip oder -> v<version>". Liefert (ip, version) oder None."""
     try:
@@ -392,6 +397,10 @@ def ask_port(p, wait=1.0):
         if "BUDDY" not in txt:
             return None
         parts = txt.split("BUDDY", 1)[1].splitlines()[0].split()
+        if len(parts) > 2:
+            BOARDS[p] = parts[2]
+            if parts[0] != "-":
+                BOARDS[parts[0]] = parts[2]
         return (parts[0] if parts else "-"), (parts[1] if len(parts) > 1 else "v1")
     except Exception:
         return None
@@ -430,8 +439,21 @@ def usb_ports(cfg):
     return ports
 
 
+_PORT_LOCKS = {}
+
+
+def _port_lock(p):
+    import threading
+    return _PORT_LOCKS.setdefault(p, threading.Lock())
+
+
 def write_port(p, data, chunked=False):
     """Schreibt data an einen Port; True wenn es geklappt hat."""
+    with _port_lock(p):
+        return _write_port(p, data, chunked)
+
+
+def _write_port(p, data, chunked=False):
     for _ in range(3):  # Port kann kurz von einem anderen Hook belegt sein
         try:
             s = open_port(p)
@@ -667,7 +689,7 @@ def image_from_tool(name, inp, resp):
     return None, ""
 
 
-LOG_FILE = os.path.join(HERE, "hook.log")
+LOG_FILE = os.path.join(DATA, "hook.log")
 LOG_SESSION = ""
 
 
@@ -1023,6 +1045,15 @@ def handle_hook():
         ev = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
     except Exception:
         ev = {}
+    out = handle_event(ev)
+    if out:
+        print(out)
+    sys.exit(0)  # Hooks duerfen Claude nie aufhalten
+
+
+def handle_event(ev):
+    """Ein Hook-Ereignis (JSON von Claude Code) an die Buddys weitergeben. Liefert die Hook-Ausgabe (meist leer)."""
+    out = ""
     global LOG_SESSION
     LOG_SESSION = str(ev.get("session_id", ""))
     name = ev.get("hook_event_name", "")
@@ -1076,7 +1107,7 @@ def handle_hook():
             dec = {"behavior": ans}
             if ans == "deny":
                 dec["message"] = "Am Claude-Buddy (Watcher) abgelehnt."
-            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": dec}}))
+            out = json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": dec}})
             send("think")
     elif name == "PreCompact":
         send("compact")
@@ -1097,8 +1128,7 @@ def handle_hook():
             pass
     elif name == "SessionEnd":
         send("bye")
-    # Hooks duerfen Claude nie aufhalten
-    sys.exit(0)
+    return out
 
 
 # ----------------------------------------------------------------- Werkzeuge
@@ -1282,7 +1312,7 @@ def find():
         if r:
             learn_device(cfg, p, r[0])
             seen.add(r[0])
-            print("Buddy an %s, WLAN: %s, Firmware %s" % (p, r[0], r[1]))
+            print("%s an %s, WLAN: %s, Firmware %s" % (BOARD_LABEL.get(BOARDS.get(p), "Buddy"), p, r[0], r[1]))
         else:
             print("%s antwortet nicht" % p)
     if usb:
@@ -1293,12 +1323,11 @@ def find():
     for ip in devs:
         if ip in seen:
             continue
-        import urllib.request
-        try:
-            txt = urllib.request.urlopen("http://%s/cmd?l=%%3F" % ip, timeout=1.5).read().decode("ascii", "replace")
-            print("Buddy per WLAN %s (zuletzt an %s), Firmware %s" % (ip, devs[ip] or "?", txt.split()[-1] if txt.startswith("BUDDY") else "?"))
+        r = ask_wlan(ip)
+        if r:
+            print("%s per WLAN %s (zuletzt an %s), Firmware %s" % (BOARD_LABEL.get(r[1], "Buddy"), ip, devs[ip] or "?", r[0]))
             seen.add(ip)
-        except Exception:
+        else:
             print("%s (zuletzt an %s) antwortet nicht" % (ip, devs[ip] or "?"))
     cfg.pop("down", None)
     save_cfg(cfg)
@@ -1467,17 +1496,53 @@ def foto(res="640", keep_on=False, show=True, rotate=None):
 
 
 # ----------------------------------------------------------------- SD-Karte des Watchers (ueber WLAN)
-def watcher_host():
-    """WLAN-Adresse des Buddys mit SD-Karte (der Watcher); None wenn keiner antwortet."""
+def ask_wlan(ip, timeout=1.5):
+    """(version, art) eines Buddys im WLAN, None wenn er nicht antwortet. Aeltere Firmware nennt keine Art."""
+    try:
+        txt = _raw_get("http://%s/cmd?l=%%3F" % ip, timeout).strip()
+    except Exception:
+        return None
+    if not txt.startswith("BUDDY"):
+        return None
+    parts = txt.split()
+    board = parts[3] if len(parts) > 3 else ""
+    if board:
+        BOARDS[ip] = board
+    return (parts[2] if len(parts) > 2 else "?"), board
+
+
+def mic_hosts():
+    """WLAN-Adressen aller Buddys mit Mikrofon (Watcher, AMOLED): die beantworten /rec."""
     import urllib.request
     cfg = load_cfg()
+    out = []
     for ip in list((cfg.get("devices") or {}).keys()) or ([cfg["host"]] if cfg.get("host") else []):
+        r = ask_wlan(ip)
+        if not r or r[1] == "tdisplay":
+            continue
         try:
-            with urllib.request.urlopen("http://%s/zeitraffer" % ip, timeout=1.5) as r:
-                if r.status == 200:
-                    return ip
+            with urllib.request.urlopen("http://%s/rec" % ip, timeout=1.5) as resp:
+                if resp.status == 200:
+                    out.append(ip)
         except Exception:
             continue
+    return out
+
+
+def watcher_host():
+    """WLAN-Adresse des Buddys mit Kamera und SD-Karte (der Watcher); None wenn keiner antwortet."""
+    import urllib.request
+    cfg = load_cfg()
+    ips = list((cfg.get("devices") or {}).keys()) or ([cfg["host"]] if cfg.get("host") else [])
+    for ip in ips:
+        r = ask_wlan(ip)
+        if r and r[1] in ("", "watcher"):  # "" = aeltere Firmware (nur der Watcher hatte /zeitraffer)
+            try:
+                with urllib.request.urlopen("http://%s/zeitraffer" % ip, timeout=1.5) as resp:
+                    if resp.status == 200:
+                        return ip
+            except Exception:
+                continue
     return None
 
 
@@ -1772,6 +1837,7 @@ PLAUDEREIEN = [
 
 
 import threading
+ZUHOEREN = {}  # Zustand fuer das Windows-Programm (Sperre, Modell geladen ...)
 WX_EVENT = threading.Event()  # gesetzt, wenn ein Buddy kein Wetter hat (z.B. nach einem Neustart)
 
 
@@ -1835,80 +1901,84 @@ def zuhoeren(args):
     import tempfile
     import urllib.parse
     import urllib.request
-    try:  # nur einmal gleichzeitig
+    try:  # nur einmal gleichzeitig (auch nicht neben dem Windows-Programm)
         lock = socket.socket()
         lock.bind(("127.0.0.1", 47811))
     except OSError:
         print("zuhoeren laeuft schon.")
         return
+    ZUHOEREN["lock"] = lock
     enter = load_cfg().get("sprache_enter", True) and "--ohne-enter" not in args
     zlog("lade Spracherkennung (%s) ..." % WHISPER_MODEL)
     from faster_whisper import WhisperModel
     model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-    zlog("bereit - Knopf am Watcher halten und sprechen")
+    ZUHOEREN["bereit"] = True
+    zlog("bereit - Knopf am Buddy halten und sprechen")
     import threading
     threading.Thread(target=extras_loop, daemon=True).start()  # Wetter + Plaudereien
-    host, last_id, last_find = None, None, 0
-    polls, beat, last_st, trace_until, fails, wx_asked = 0, 0, 0, 0, 0, 0
-    pair_asked = 0
+    hosts, last_find = [], 0
+    polls, beat, wx_asked = 0, 0, 0
+    last_st, trace_until, fails, pair_asked = {}, {}, {}, {}
     while True:
-        try:
-            if not host or time.time() - last_find > 60:
-                h = watcher_host()
-                last_find = time.time()
-                if h and h != host:
-                    zlog("Watcher: %s" % h)
-                host = h or host
-                if not host:
-                    time.sleep(3)
-                    continue
-            tq = time.time()
-            st = json.loads(urllib.request.urlopen("http://%s/rec" % host, timeout=1.5).read())
-            fails = 0
-            polls += 1
-            if st.get("wx") == 0 and time.time() - wx_asked > 60:  # Watcher hat kein Wetter: sofort schicken
-                wx_asked = time.time()
-                WX_EVENT.set()
-            if st["st"] != last_st:
-                if st["st"]:
-                    zlog("Watcher: %s" % {1: "nimmt auf", 2: "Aufnahme wartet", 3: "abgeholt"}.get(st["st"], st["st"]))
-                    if st["st"] == 1:
-                        trace_until = time.time() + 15
-                last_st = st["st"]
-            if time.time() < trace_until:  # Fehlersuche: jede Abfrage nach Aufnahmebeginn mitschreiben
-                zlog("  Abfrage: %s (%.2f s)" % (st, time.time() - tq))
-            if polls == 1 or time.time() - beat > 600:  # Lebenszeichen im Protokoll
-                beat = time.time()
-                zlog("lebt (%d Abfragen, Watcher meldet %s)" % (polls, st))
-            # st 2 = Aufnahme wartet auf den PC (nach dem Abholen wird daraus 3). Die Nummer allein reicht nicht:
-            # nach einem Neustart des Watchers (z.B. Update) faengt sie wieder bei 1 an.
-            if st["st"] == 2:
-                last_id = st["id"]
-                wav = urllib.request.urlopen("http://%s/rec.wav" % host, timeout=10).read()
-                t0 = time.time()
-                text = transcribe(model, wav)
-                zlog("erkannt in %.1f s (%.1f s Ton): %s" % (time.time() - t0, st["ms"] / 1000, text or "-"))
-                show = ascii_only(text, 66)
-                urllib.request.urlopen("http://%s/cmd?%s" % (host, urllib.parse.urlencode({"l": "R " + show if show else "R"})), timeout=3).read()
-                if text:
-                    type_text(text, enter)
-            time.sleep(0.35)
-        except KeyboardInterrupt:
-            return
-        except Exception as e:  # WLAN-Aussetzer (z.B. Hand ueber der Antenne) oder Watcher startet neu
-            if getattr(e, "code", 0) == 401 and host and time.time() - pair_asked > 600 and paired_ok(host) is False:
-                pair_asked = time.time()
-                zlog("Watcher %s ist nicht gekoppelt - frage per Knopfdruck" % host)
-                zlog("gekoppelt" if button_pair(host, quiet=True) else "nicht gekoppelt (python buddy.py koppeln)")
-                continue
-            fails += 1
-            if fails <= 3 or fails % 20 == 0:
-                zlog("Fehler (%d): %s" % (fails, e))
-            if fails >= 10:  # laenger weg: Watcher neu suchen
-                host = None
+        if not hosts or time.time() - last_find > 60:
+            try:
+                found = mic_hosts()
+            except Exception:
+                found = []
+            last_find = time.time()
+            for h in found:
+                if h not in hosts:
+                    zlog("Buddy mit Mikrofon: %s (%s)" % (h, BOARD_LABEL.get(BOARDS.get(h), "?")))
+            hosts = found or hosts
+            if not hosts:
                 time.sleep(3)
-            else:
-                time.sleep(0.5)  # sofort nochmal, die Aufnahme wartet
+                continue
+        for host in list(hosts):
+            try:
+                tq = time.time()
+                st = json.loads(urllib.request.urlopen("http://%s/rec" % host, timeout=1.5).read())
+                fails[host] = 0
+                polls += 1
+                if st.get("wx") == 0 and time.time() - wx_asked > 60:  # Buddy hat kein Wetter: sofort schicken
+                    wx_asked = time.time()
+                    WX_EVENT.set()
+                if st["st"] != last_st.get(host):
+                    if st["st"]:
+                        zlog("%s: %s" % (host, {1: "nimmt auf", 2: "Aufnahme wartet", 3: "abgeholt"}.get(st["st"], st["st"])))
+                        if st["st"] == 1:
+                            trace_until[host] = time.time() + 15
+                    last_st[host] = st["st"]
+                if time.time() < trace_until.get(host, 0):  # Fehlersuche: jede Abfrage nach Aufnahmebeginn mitschreiben
+                    zlog("  %s Abfrage: %s (%.2f s)" % (host, st, time.time() - tq))
+                if polls == 1 or time.time() - beat > 600:  # Lebenszeichen im Protokoll
+                    beat = time.time()
+                    zlog("lebt (%d Abfragen, %d Buddys, %s meldet %s)" % (polls, len(hosts), host, st))
+                # st 2 = Aufnahme wartet auf den PC (nach dem Abholen wird daraus 3). Die Nummer allein reicht nicht:
+                # nach einem Neustart (z.B. Update) faengt sie wieder bei 1 an.
+                if st["st"] == 2:
+                    wav = urllib.request.urlopen("http://%s/rec.wav" % host, timeout=10).read()
+                    t0 = time.time()
+                    text = transcribe(model, wav)
+                    zlog("erkannt in %.1f s (%.1f s Ton): %s" % (time.time() - t0, st["ms"] / 1000, text or "-"))
+                    show = ascii_only(text, 66)
+                    urllib.request.urlopen("http://%s/cmd?%s" % (host, urllib.parse.urlencode({"l": "R " + show if show else "R"})), timeout=3).read()
+                    if text:
+                        type_text(text, enter)
+            except KeyboardInterrupt:
+                return
+            except Exception as e:  # WLAN-Aussetzer (z.B. Hand ueber der Antenne) oder Buddy startet neu
+                if getattr(e, "code", 0) == 401 and time.time() - pair_asked.get(host, 0) > 600 and paired_ok(host) is False:
+                    pair_asked[host] = time.time()
+                    zlog("%s ist nicht gekoppelt - frage per Knopfdruck" % host)
+                    zlog("gekoppelt" if button_pair(host, quiet=True) else "nicht gekoppelt (python buddy.py koppeln)")
+                    continue
+                fails[host] = fails.get(host, 0) + 1
+                if fails[host] <= 3 or fails[host] % 20 == 0:
+                    zlog("%s Fehler (%d): %s" % (host, fails[host], e))
+                if fails[host] >= 10:  # laenger weg: nicht mehr abfragen, bis er wieder gefunden wird
+                    hosts.remove(host)
+                    fails[host] = 0
+        time.sleep(0.35 if len(hosts) < 2 else 0.2)
 
 
 def foto_save(jpg, show=True, rotate=None):
