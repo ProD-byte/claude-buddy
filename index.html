@@ -9,41 +9,83 @@
 :root{--bg:#1f1e1c;--card:#2b2a27;--line:#45423d;--ink:#f2eee6;--mute:#a39e95;--acc:#d97757;color-scheme:dark}
 body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 main{max-width:860px;margin:0 auto;padding:24px 16px 48px}
-h1{margin:0 0 4px}.mute{color:var(--mute)}
+h1{margin:0 0 4px}.mute{color:var(--mute)} h2{margin:0 0 6px;font-size:20px}
 .box{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin-top:16px}
-button{background:var(--acc);color:#fff;border:0;border-radius:10px;padding:10px 16px;font:600 15px system-ui;cursor:pointer}
+.box.main{border-color:var(--acc)}
+button,.btn{display:inline-block;background:var(--acc);color:#fff;border:0;border-radius:10px;padding:10px 16px;font:600 15px system-ui;cursor:pointer;text-decoration:none}
 a{color:var(--acc)} code{background:#00000040;padding:1px 5px;border-radius:5px}
+ol{padding-left:20px} li{margin:4px 0}
+.dev{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 12px} .dev label{background:#00000030;border:1px solid var(--line);border-radius:9px;padding:6px 10px;cursor:pointer}
+.dev input{margin-right:6px} .hid{display:none}
 iframe{display:block;width:100%;height:1300px;border:0;margin-top:16px}
 </style>
 </head>
 <body><main>
 <h1>Claude-Buddy</h1>
-<p class="mute"><span data-i="for">Zeigt auf dem LILYGO T-Display-S3, was Claude Code gerade macht.</span> · Build 14 ·
+<p class="mute"><span data-i="for">Ein kleiner Begleiter, der zeigt, was Claude Code gerade macht – auf dem LILYGO T-Display-S3, dem SenseCAP Watcher oder dem Waveshare AMOLED 1.75C.</span> · Build 14 ·
 <span data-i="inof">Inoffizielles Bastelprojekt, kein Produkt von Anthropic.</span></p>
+
+<div class="box main">
+<h2 data-i="ah">💻 Windows-Programm (empfohlen)</h2>
+<p data-i="ap">Ein Installer, der alles erledigt: Buddy anstecken – der Assistent bespielt ihn bei Bedarf, bringt ihn ins WLAN, koppelt ihn, lädt die Spracherkennung und verbindet Claude Code. Danach sitzt er als Symbol neben der Uhr und aktualisiert sich und die Buddys von selbst.</p>
+<p><a class="btn" href="https://github.com/ProD-byte/claude-buddy/releases/latest/download/ClaudeBuddySetup.exe" data-i="ab">⬇ ClaudeBuddySetup.exe laden</a></p>
+<ol>
+<li data-i="a1">Installer starten (ohne Administratorrechte). Warnt Windows („Der Computer wurde durch Windows geschützt“): <b>Weitere Informationen → Trotzdem ausführen</b>.</li>
+<li data-i="a2">Buddy per USB anstecken und den Einrichtungsassistenten durchklicken.</li>
+<li data-i="a3">Claude Code neu starten – ab dann meldet jede Sitzung dem Buddy, was sie tut.</li>
+</ol>
+</div>
+
 <div class="box">
-<h2 data-i="fh">⚡ Firmware</h2>
+<h2 data-i="hh">📖 Handbuch</h2>
+<p data-i="hp">Wie alles funktioniert: Geräte, Bedienung, Sprechen und Vorlesen, Kopplung, sichere Updates, Fehlersuche.</p>
+<p><a class="btn" href="Claude-Buddy-Handbuch.pdf" target="_blank" data-i="hb">Handbuch öffnen (PDF)</a></p>
+</div>
+
+<div class="box">
+<h2 data-i="fh">⚡ Firmware im Browser</h2>
+<p data-i="fp">Ohne Programm, direkt aus Chrome oder Edge. Gerät wählen:</p>
+<div class="dev">
+<label><input type="radio" name="dev" value="tdisplay" checked>T-Display-S3</label>
+<label><input type="radio" name="dev" value="watcher">SenseCAP Watcher</label>
+<label><input type="radio" name="dev" value="amoled">AMOLED 1.75C</label>
+</div>
+<div id="upd">
 <p data-i="up">Update: Einstellungen und WLAN bleiben erhalten. Bei „Erase device?“ den Haken <b>nicht</b> setzen.</p>
 <esp-web-install-button manifest="manifest-update.json"><button slot="activate" data-i="upb">⚡ Update installieren</button>
 <span slot="unsupported" data-i="uns">Bitte Chrome oder Edge am Computer verwenden.</span><span slot="not-allowed">https only</span></esp-web-install-button>
+</div>
 <p data-i="neup">Neuinstallation: löscht alles – für neue Boards oder wenn nichts mehr geht.</p>
-<esp-web-install-button manifest="manifest-neu.json"><button slot="activate" data-i="neub">🗑️ Löschen &amp; neu installieren</button>
+<esp-web-install-button id="neu" manifest="manifest-neu.json"><button slot="activate" data-i="neub">🗑️ Löschen &amp; neu installieren</button>
 <span slot="unsupported" data-i="uns2">Bitte Chrome oder Edge am Computer verwenden.</span><span slot="not-allowed">https only</span></esp-web-install-button>
+<p class="mute" data-i="fh2">Watcher und AMOLED aktualisieren sich danach selbst über das WLAN. Watcher: den unteren USB-Anschluss nehmen.</p>
 </div>
+
 <div class="box">
-<h2 data-i="ph">💻 PC einrichten</h2>
-<p data-i="pp">Python installieren, dann <a href="buddy.py" download>buddy.py</a> herunterladen und im selben Ordner ausführen:</p>
-<p><code>pip install pyserial pillow</code><br><code>python buddy.py install</code></p>
-<p data-i="pp2">Das trägt Hooks in Claude Code ein. Jede neue Sitzung meldet dem Buddy dann, was sie gerade tut – per USB oder WLAN (<code>python buddy.py wifi</code> bzw. am Gerät beide Tasten 2 s halten). Testen: <code>python buddy.py demo</code>.</p>
+<h2 data-i="ph">🐧 Linux / Mac: PC-Skript</h2>
+<p data-i="pp">Ohne Windows-Programm: Python installieren, <a href="buddy.py" download>buddy.py</a> laden und im selben Ordner <code>pip install pyserial pillow</code> und <code>python buddy.py install</code> ausführen.</p>
 </div>
+
 <iframe id="sim" src="simulation.html" title="Claude-Buddy Simulation"></iframe>
 <script>
+document.querySelectorAll('input[name=dev]').forEach(r => r.addEventListener('change', () => {
+  const d = document.querySelector('input[name=dev]:checked').value;
+  document.getElementById('upd').classList.toggle('hid', d !== 'tdisplay');
+  document.getElementById('neu').setAttribute('manifest', d === 'tdisplay' ? 'manifest-neu.json' : 'manifest-neu-' + d + '.json');
+}));
 if (!(navigator.language || 'de').toLowerCase().startsWith('de')) {
-  const TX = {for: 'Shows on the LILYGO T-Display-S3 what Claude Code is doing right now.', inof: 'Unofficial hobby project, not a product of Anthropic.',
-    fh: '⚡ Firmware', up: 'Update: settings and Wi-Fi are kept. Do <b>not</b> tick “Erase device?”.', upb: '⚡ Install update',
+  const TX = {for: 'A little companion that shows what Claude Code is doing – on the LILYGO T-Display-S3, the SenseCAP Watcher or the Waveshare AMOLED 1.75C.',
+    inof: 'Unofficial hobby project, not a product of Anthropic.',
+    ah: '💻 Windows app (recommended)', ap: 'One installer does it all: plug in the buddy – the wizard flashes it if needed, brings it onto your Wi-Fi, pairs it, downloads speech recognition and connects Claude Code. Afterwards it sits next to the clock and keeps itself and the buddies up to date.',
+    ab: '⬇ Download ClaudeBuddySetup.exe', a1: 'Run the installer (no admin rights). If Windows warns (“Windows protected your PC”): <b>More info → Run anyway</b>.',
+    a2: 'Plug in the buddy via USB and click through the setup wizard.', a3: 'Restart Claude Code – from then on every session tells the buddy what it is doing.',
+    hh: '📖 Manual (German)', hp: 'How it all works: devices, controls, talking and reading aloud, pairing, safe updates, troubleshooting.', hb: 'Open manual (PDF)',
+    fh: '⚡ Firmware in the browser', fp: 'Without the app, straight from Chrome or Edge. Pick the device:',
+    up: 'Update: settings and Wi-Fi are kept. Do <b>not</b> tick “Erase device?”.', upb: '⚡ Install update',
     uns: 'Please use Chrome or Edge on a computer.', uns2: 'Please use Chrome or Edge on a computer.',
     neup: 'Fresh install: erases everything – for new boards or when nothing works anymore.', neub: '🗑️ Erase &amp; install',
-    ph: '💻 Set up the PC', pp: 'Install Python, then download <a href="buddy.py" download>buddy.py</a> and run in the same folder:',
-    pp2: 'This adds hooks to Claude Code. Every new session then tells the buddy what it is doing – via USB or Wi-Fi (<code>python buddy.py wifi</code>, or hold both buttons on the device for 2 s). Test: <code>python buddy.py demo</code>.'};
+    fh2: 'Watcher and AMOLED then update themselves over Wi-Fi. Watcher: use the lower USB port.',
+    ph: '🐧 Linux / Mac: PC script', pp: 'Without the Windows app: install Python, download <a href="buddy.py" download>buddy.py</a> and run <code>pip install pyserial pillow</code> and <code>python buddy.py install</code> in the same folder.'};
   document.documentElement.lang = 'en';
   document.querySelectorAll('[data-i]').forEach(e => { if (TX[e.dataset.i]) e.innerHTML = TX[e.dataset.i]; });
   document.getElementById('sim').src = 'simulation.html?lang=en';

@@ -1,0 +1,16 @@
+{
+  "name": "Claude-Buddy AMOLED 1.75C (Neuinstallation)",
+  "version": "14",
+  "new_install_prompt_erase": false,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        {
+          "path": "komplett-amoled.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}
