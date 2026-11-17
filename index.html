@@ -18,12 +18,23 @@ ol{padding-left:20px} li{margin:4px 0}
 .dev{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 12px} .dev label{background:#00000030;border:1px solid var(--line);border-radius:9px;padding:6px 10px;cursor:pointer}
 .dev input{margin-right:6px} .hid{display:none}
 iframe{display:block;width:100%;height:1300px;border:0;margin-top:16px}
+.dvs{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.dv{display:flex;flex-direction:column;gap:8px;background:#00000025;border:1px solid var(--line);border-radius:12px;padding:12px}.dv .pic{display:block;background:#fff;border-radius:10px;overflow:hidden;aspect-ratio:4/3}.dv img{width:100%;height:100%;object-fit:contain;display:block}.dv .mute{flex:1;font-size:14px}
 </style>
 </head>
 <body><main>
 <h1>Claude-Buddy</h1>
 <p class="mute"><span data-i="for">Ein kleiner Begleiter, der zeigt, was Claude Code gerade macht – auf dem LILYGO T-Display-S3, dem SenseCAP Watcher oder dem Waveshare AMOLED 1.75C.</span> · Build 14 ·
 <span data-i="inof">Inoffizielles Bastelprojekt, kein Produkt von Anthropic.</span></p>
+
+<div class="box">
+<h2 data-i="dvh">🛒 Die Geräte</h2>
+<div class="dvs">
+<div class="dv"><a href="https://lilygo.cc/products/t-display-s3" target="_blank" rel="noopener" class="pic"><img src="https://lilygo.cc/cdn/shop/files/H569_03.jpg?v=1774661646&width=800" alt="LILYGO T-Display-S3" loading="lazy"></a><b>LILYGO T-Display-S3</b><span class="mute" data-i="dv_t">Der kleine Einstieg: 1,9-Zoll-Display, zwei Tasten. Optional Summer und LED nachrüsten.</span><a class="btn" href="https://lilygo.cc/products/t-display-s3" target="_blank" rel="noopener" data-i="dvb_t">Beim Hersteller kaufen →</a></div>
+<div class="dv"><a href="https://www.seeedstudio.com/SenseCAP-Watcher-W1-A-p-5979.html" target="_blank" rel="noopener" class="pic"><img src="https://media-cdn.seeedstudio.com/cdn-cgi/image/format=auto%2Cwidth=800%2Cquality=85/media/catalog/product/cache/961a49e1875f8c1f40e5990d74e68365/1/-/1-113991315-sensecap-watcher-w1-a_1.jpg" alt="SenseCAP Watcher W1-A" loading="lazy"></a><b>SenseCAP Watcher W1-A</b><span class="mute" data-i="dv_w">Rundes Display, Drehknopf, Mikrofon, Lautsprecher, Kamera, SD-Karte und Akku – alles drin.</span><a class="btn" href="https://www.seeedstudio.com/SenseCAP-Watcher-W1-A-p-5979.html" target="_blank" rel="noopener" data-i="dvb_w">Beim Hersteller kaufen →</a></div>
+<div class="dv"><a href="https://www.waveshare.com/esp32-s3-touch-amoled-1.75c.htm" target="_blank" rel="noopener" class="pic"><img src="https://www.waveshare.com/media/catalog/product/cache/1/image/800x800/9df78eab33525d08d6e5fb8d27136e95/e/s/esp32-s3-touch-amoled-1.75c-1.jpg" alt="Waveshare ESP32-S3-Touch-AMOLED-1.75C" loading="lazy"></a><b>Waveshare ESP32-S3-Touch-AMOLED-1.75C</b><span class="mute" data-i="dv_a">Brillantes rundes AMOLED mit Touch, zwei Mikrofone und Lautsprecher im Alu-Gehäuse. Die LED leuchtet als Ring am Rand.</span><a class="btn" href="https://www.waveshare.com/esp32-s3-touch-amoled-1.75c.htm" target="_blank" rel="noopener" data-i="dvb_a">Beim Hersteller kaufen →</a></div>
+</div>
+<p class="mute" style="font-size:12px" data-i="dvc">Produktbilder und Links: LILYGO, Seeed Studio und Waveshare (jeweils die offiziellen Shops). Keine Werbepartnerschaft.</p>
+</div>
 
 <div class="box">
 <h2 data-i="ah">💻 Windows-Programm</h2>
@@ -84,6 +95,7 @@ document.querySelectorAll('input[name=dev]').forEach(r => r.addEventListener('ch
 if (!(navigator.language || 'de').toLowerCase().startsWith('de')) {
   const TX = {for: 'A little companion that shows what Claude Code is doing – on the LILYGO T-Display-S3, the SenseCAP Watcher or the Waveshare AMOLED 1.75C.',
     inof: 'Unofficial hobby project, not a product of Anthropic.',
+    dvh: '🛒 The devices', dvc: 'Product images and links: LILYGO, Seeed Studio and Waveshare (their official shops). Not sponsored.', dv_t: 'The small entry: 1.9-inch display, two buttons. Buzzer and LED can be added.', dvb_t: 'Buy from the manufacturer →', dv_w: 'Round display, rotary knob, microphone, speaker, camera, SD card and battery – everything built in.', dvb_w: 'Buy from the manufacturer →', dv_a: 'Brilliant round AMOLED with touch, two microphones and speaker in an aluminium case. The LED glows as a ring around the edge.', dvb_a: 'Buy from the manufacturer →',
     ah: '💻 Windows app', ap: 'One installer does it all: plug in the buddy – the wizard flashes it if needed, brings it onto your Wi-Fi, pairs it, downloads speech recognition and connects Claude Code. Afterwards it sits next to the clock and keeps itself and the buddies up to date.',
     ab: '⬇ Download ClaudeBuddySetup.exe', a1: 'Run the installer (no admin rights). If Windows warns (“Windows protected your PC”): <b>More info → Run anyway</b>.',
     a2: 'Plug in the buddy via USB and click through the setup wizard.', a3: 'Restart Claude Code – from then on every session tells the buddy what it is doing.',
