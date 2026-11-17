@@ -867,6 +867,82 @@ $r.ReadBytes($b)
 """
 
 
+# Linux: Piper (offline, neuronale Stimmen von rhasspy/piper-voices). Die Modelle laedt der Einrichtungsassistent.
+PIPER_VOICES = {"mann": ("de_DE-thorsten-medium", "de/de_DE/thorsten/medium"),
+                "frau": ("de_DE-kerstin-low", "de/de_DE/kerstin/low")}
+PIPER_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/%s/%s%s"
+_PIPER = {}
+if os.name != "nt":
+    VOICE_LABEL = {"frau": "Frau (Kerstin)", "mann": "Mann (Thorsten)"}
+
+
+def piper_dir():
+    return os.path.join(DATA, "stimmen")
+
+
+def piper_model(art):
+    """Pfad der Piper-Stimme (.onnx) oder None, wenn sie noch nicht geladen ist."""
+    name = PIPER_VOICES.get(art, PIPER_VOICES["frau"])[0]
+    pth = os.path.join(piper_dir(), name + ".onnx")
+    return pth if os.path.exists(pth) and os.path.exists(pth + ".json") else None
+
+
+def piper_download(art, progress=None):
+    """Piper-Stimme (Modell + Beschreibung) laden; progress(0..100)."""
+    import urllib.request
+    name, sub = PIPER_VOICES[art]
+    os.makedirs(piper_dir(), exist_ok=True)
+    for ext in (".onnx.json", ".onnx"):
+        dst = os.path.join(piper_dir(), name + ext)
+        tmp = dst + ".tmp"
+        with urllib.request.urlopen(PIPER_URL % (sub, name, ext), timeout=60) as r, open(tmp, "wb") as f:
+            total, done = int(r.headers.get("Content-Length") or 0), 0
+            while True:
+                b = r.read(65536)
+                if not b:
+                    break
+                f.write(b)
+                done += len(b)
+                if progress and total and ext == ".onnx":
+                    progress(int(done * 100 / total))
+        os.replace(tmp, dst)
+    return piper_model(art)
+
+
+def _piper_wav(text, art, wp):
+    import wave
+    model = piper_model(art)
+    if not model:
+        return False
+    from piper import PiperVoice
+    v = _PIPER.get(model) or PiperVoice.load(model)
+    _PIPER[model] = v
+    with wave.open(wp, "wb") as wf:
+        if hasattr(v, "synthesize_wav"):  # piper-tts ab 1.3
+            v.synthesize_wav(text, wf)
+        else:
+            v.synthesize(text, wf)
+    return os.path.getsize(wp) > 2000
+
+
+def tts_wav_linux(text, art):
+    import shutil
+    import subprocess
+    import tempfile
+    wp = os.path.join(tempfile.gettempdir(), "buddy-sag.wav")
+    try:
+        if _piper_wav(text, art, wp) and to16k_mono(wp):
+            return loud_wav(wp)
+    except Exception as e:
+        zlog("Piper: %s" % e)
+    esp = shutil.which("espeak-ng") or shutil.which("espeak")  # Rueckfall: klingt roboterhaft, geht aber immer
+    if esp:
+        subprocess.run([esp, "-v", "de+m3" if art == "mann" else "de+f3", "-s", "165", "-w", wp, text], timeout=30)
+        if os.path.exists(wp) and to16k_mono(wp):
+            return loud_wav(wp)
+    raise RuntimeError("Keine Stimme: Piper-Stimmen im Programm laden oder espeak-ng installieren")
+
+
 def voice_for(host=None):
     """"frau" oder "mann": je Buddy (config "stimmen" {ip: art}), sonst die allgemeine Wahl (config "stimme_art")."""
     cfg = load_cfg()
@@ -898,6 +974,8 @@ def to16k_mono(path):
 
 def tts_wav(text, art=None):
     """Text -> WAV-Bytes (16 kHz, mono, 16 Bit), offline mit einer Windows-Stimme. art: "frau" / "mann"."""
+    if os.name != "nt":
+        return tts_wav_linux(text, art or voice_for())
     import subprocess
     import tempfile
     d = tempfile.gettempdir()
@@ -1473,7 +1551,13 @@ def wifi():
 # Die Kamera haengt am KI-Chip Himax WE2. Der ist ueber den anderen Kanal des CH342 direkt am PC
 # (SSCMA-AT-Befehle, 921600 Baud); der Buddy schaltet nur seinen Strom ("K 1" / "K 0").
 # Fotos bleiben lokal (nicht im synchronisierten Projektordner), die letzten FOTO_MAX werden behalten.
-FOTO_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "claude-buddy", "fotos")
+def user_dir():
+    """Windows: %LOCALAPPDATA%, Linux: $XDG_DATA_HOME bzw. ~/.local/share."""
+    return (os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME")
+            or os.path.join(os.path.expanduser("~"), ".local", "share"))
+
+
+FOTO_DIR = os.path.join(user_dir(), "claude-buddy", "fotos")
 FOTO_MAX = 30
 FOTO_RES = {"240": 0, "416": 1, "480": 2, "640": 3}
 
@@ -1834,7 +1918,7 @@ def protokoll(n=15):
 # ----------------------------------------------------------------- Sprechen (Watcher-Knopf halten)
 # Der Watcher nimmt auf, solange der Knopf gehalten wird. "zuhoeren" fragt /rec ab, holt /rec.wav,
 # erkennt den Text offline mit faster-whisper und fuegt ihn ins aktive Fenster ein (+ Enter).
-LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "claude-buddy")
+LOG_DIR = os.path.join(user_dir(), "claude-buddy")
 WHISPER_MODEL = "small"
 WHISPER_HINT = "Claude, Claude Code, Buddy, Watcher, ESP32, T-Display, PlatformIO, GitHub, Commit, Push, Firmware, Python."
 
@@ -1905,8 +1989,43 @@ def clip_set(text):
         u.CloseClipboard()
 
 
+def type_text_linux(text, enter=True):
+    """Linux: Text direkt tippen lassen (geht auch in Terminals, wo Strg+V nicht einfuegt).
+    X11: xdotool, Wayland: wtype oder ydotool. Liefert False, wenn keins davon da ist."""
+    import shutil
+    import subprocess
+    wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
+    tools = (["wtype", "ydotool", "xdotool"] if wayland else ["xdotool", "wtype", "ydotool"])
+    for t in tools:
+        if not shutil.which(t):
+            continue
+        try:
+            if t == "xdotool":
+                subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "4", "--", text], timeout=60, check=True)
+                if enter:
+                    time.sleep(0.15)
+                    subprocess.run(["xdotool", "key", "--clearmodifiers", "Return"], timeout=5)
+            elif t == "wtype":
+                subprocess.run(["wtype", "--", text], timeout=60, check=True)
+                if enter:
+                    time.sleep(0.15)
+                    subprocess.run(["wtype", "-k", "Return"], timeout=5)
+            else:
+                subprocess.run(["ydotool", "type", "--", text], timeout=60, check=True)
+                if enter:
+                    time.sleep(0.15)
+                    subprocess.run(["ydotool", "key", "28:1", "28:0"], timeout=5)
+            return True
+        except Exception as e:
+            zlog("Tippen mit %s ging nicht: %s" % (t, e))
+    zlog("Kein Werkzeug zum Tippen gefunden - bitte xdotool (X11) bzw. wtype/ydotool (Wayland) installieren.")
+    return False
+
+
 def type_text(text, enter=True):
     """Text ueber die Zwischenablage ins aktive Fenster einfuegen (Strg+V), optional Enter; alte Zwischenablage zurueck."""
+    if os.name != "nt":
+        return type_text_linux(text, enter)
     import ctypes
     kb = ctypes.windll.user32.keybd_event
     old = clip_get()

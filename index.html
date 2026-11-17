@@ -61,9 +61,17 @@ iframe{display:block;width:100%;height:1300px;border:0;margin-top:16px}
 <p class="mute" data-i="fh2">Watcher und AMOLED aktualisieren sich danach selbst über das WLAN. Watcher: den unteren USB-Anschluss nehmen.</p>
 </div>
 
-<div class="box">
-<h2 data-i="ph">🐧 Linux / Mac: PC-Skript</h2>
-<p data-i="pp">Ohne Windows-Programm: Python installieren, <a href="buddy.py" download>buddy.py</a> laden und im selben Ordner <code>pip install pyserial pillow</code> und <code>python buddy.py install</code> ausführen.</p>
+<div class="box main">
+<h2 data-i="lh">🐧 Linux-Programm</h2>
+<p data-i="lp">Dasselbe Programm für Linux als AppImage – eine Datei, keine Installation. Stimmen: Kerstin und Thorsten (Piper, offline).</p>
+<p><a class="btn" href="https://github.com/ProD-byte/claude-buddy/releases/latest/download/ClaudeBuddy-x86_64.AppImage" data-i="lb1">⬇ PC / Laptop (x86_64)</a>
+<a class="btn" href="https://github.com/ProD-byte/claude-buddy/releases/latest/download/ClaudeBuddy-aarch64.AppImage" data-i="lb2">⬇ Raspberry Pi (ARM64)</a></p>
+<ol>
+<li data-i="l1">Ausführbar machen und starten: <code>chmod +x ClaudeBuddy-*.AppImage</code>, dann doppelklicken.</li>
+<li data-i="l2">Zugriff auf USB einmalig erlauben: <code>sudo usermod -aG dialout $USER</code>, danach ab- und wieder anmelden.</li>
+<li data-i="l3">Für Sprechen per Knopf: <code>xdotool</code> (X11) bzw. <code>wtype</code> (Wayland) installieren. GNOME zeigt das Symbol neben der Uhr mit der Erweiterung „AppIndicator“.</li>
+</ol>
+<p class="mute" data-i="lp2">Ganz ohne Programm geht auch das PC-Skript: <a href="buddy.py" download>buddy.py</a> mit <code>pip install pyserial pillow</code> und <code>python3 buddy.py install</code>.</p>
 </div>
 
 <iframe id="sim" src="simulation.html" title="Claude-Buddy Simulation"></iframe>
@@ -85,7 +93,12 @@ if (!(navigator.language || 'de').toLowerCase().startsWith('de')) {
     uns: 'Please use Chrome or Edge on a computer.', uns2: 'Please use Chrome or Edge on a computer.',
     neup: 'Fresh install: erases everything – for new boards or when nothing works anymore.', neub: '🗑️ Erase &amp; install',
     fh2: 'Watcher and AMOLED then update themselves over Wi-Fi. Watcher: use the lower USB port.',
-    ph: '🐧 Linux / Mac: PC script', pp: 'Without the Windows app: install Python, download <a href="buddy.py" download>buddy.py</a> and run <code>pip install pyserial pillow</code> and <code>python buddy.py install</code> in the same folder.'};
+    lh: '🐧 Linux app', lp: 'The same app for Linux as an AppImage – one file, no installation. Voices: Kerstin and Thorsten (Piper, offline).',
+    lb1: '⬇ PC / laptop (x86_64)', lb2: '⬇ Raspberry Pi (ARM64)',
+    l1: 'Make it executable and start it: <code>chmod +x ClaudeBuddy-*.AppImage</code>, then double-click.',
+    l2: 'Allow USB access once: <code>sudo usermod -aG dialout $USER</code>, then log out and back in.',
+    l3: 'For talking by button: install <code>xdotool</code> (X11) or <code>wtype</code> (Wayland). On GNOME the tray icon needs the “AppIndicator” extension.',
+    lp2: 'Without any app there is still the PC script: <a href="buddy.py" download>buddy.py</a> with <code>pip install pyserial pillow</code> and <code>python3 buddy.py install</code>.'};
   document.documentElement.lang = 'en';
   document.querySelectorAll('[data-i]').forEach(e => { if (TX[e.dataset.i]) e.innerHTML = TX[e.dataset.i]; });
   document.getElementById('sim').src = 'simulation.html?lang=en';
