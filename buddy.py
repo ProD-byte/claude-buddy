@@ -1,4 +1,4 @@
-"""Claude-Buddy: schickt den Arbeitszustand von Claude Code an das T-Display-S3.
+"""Claude-Buddy: schickt den Arbeitszustand von Claude Code an den SenseCAP Watcher.
 
 Aufrufe:
   python buddy.py hook            (von den Claude-Code-Hooks, liest JSON von stdin)
@@ -36,7 +36,7 @@ Aufrufe:
   python buddy.py sprache [aus]   Sprechen per Watcher-Knopf einrichten: faster-whisper + Autostart (aus = entfernen)
   python buddy.py uninstall       Hooks (und Autostart) wieder entfernen
   python buddy.py koppeln [ip] [--neu]  PC mit den Buddys koppeln (ohne Passwort): angesteckte per USB sofort,
-                                  die anderen per Knopfdruck am Geraet (Watcher: druecken, T-Display: IO14)
+                                  die anderen per Knopfdruck am Watcher (druecken = ja, drehen = nein)
   python buddy.py link            Browser-Adressen der Buddys mit Schluessel (z.B. fuer die SD-Seite)
   python buddy.py flash <ip> <firmware.bin>  Firmware per WLAN aufspielen (pio run -e watcher-wlan -t upload)
 
@@ -44,8 +44,8 @@ Sicherheit: Im WLAN nimmt ein Buddy Befehle nur von gekoppelten PCs an. Die Schl
 pc/kopplung.json; geht etwas schief, koppelt buddy.py per USB oder Knopfdruck neu.
 
 Verbindung: zuerst USB, sonst WLAN (IP aus config.json, sonst claude-buddy.local).
-Alle Buddys bekommen die Meldung: angesteckte per USB (T-Display-S3 am Espressif-Port,
-SenseCAP Watcher am zweiten Kanal seines CH342), alle anderen bekannten per WLAN.
+Alle Buddys bekommen die Meldung: angesteckte per USB (am zweiten Kanal des CH342 im Watcher),
+alle anderen bekannten per WLAN.
 Welche WLAN-Adresse zu welchem USB-Port gehoert, merkt sich config.json ("devices").
 Alle Befehle gehen auch per WLAN. Mit --wlan wird USB uebersprungen (zum Testen).
 """
@@ -57,7 +57,6 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("CLAUDE_BUDDY_DATA") or HERE  # das Windows-Programm setzt %LOCALAPPDATA%\ClaudeBuddy
 CFG_FILE = os.path.join(DATA, "config.json")
-ESPRESSIF_VID = 0x303A
 CH342_VID, CH342_PID = 0x1A86, 0x55D2  # SenseCAP Watcher: Kanal x.2 = ESP32-S3 (x.0 ist der Kamera-Chip)
 SCAN_EVERY = 20  # s: so oft nach neu angesteckten Buddys suchen
 
@@ -260,7 +259,7 @@ def button_pair(host, wait=65, quiet=False):
             print("%s: Kopplung nicht moeglich (%s)" % (host, e))
         return False
     if not quiet:
-        print("%s fragt jetzt \"Koppeln?\" - Watcher: druecken (drehen = nein), AMOLED: PWR (BOOT = nein), T-Display: IO14 (IO0 = nein)." % host)
+        print("%s fragt jetzt \"Koppeln?\" - am Watcher druecken (drehen = nein)." % host)
     t = time.time()
     while time.time() - t < wait:
         time.sleep(1)
@@ -409,17 +408,15 @@ def find_ports():
         from serial.tools import list_ports
         out = []
         for p in list_ports.comports():
-            if p.vid == ESPRESSIF_VID:
-                out.append(p.device)
-            elif p.vid == CH342_VID and p.pid == CH342_PID and (p.location or "").endswith(".2"):
+            if p.vid == CH342_VID and p.pid == CH342_PID and (p.location or "").endswith(".2"):
                 out.append(p.device)
         return out
     except Exception:
         return []
 
 
-BOARDS = {}  # Port oder IP -> Geraeteart aus der Antwort auf "?" ("watcher", "amoled", "tdisplay")
-BOARD_LABEL = {"watcher": "SenseCAP Watcher", "amoled": "AMOLED 1.75C", "tdisplay": "T-Display-S3"}
+BOARDS = {}  # Port oder IP -> Geraeteart aus der Antwort auf "?" ("watcher")
+BOARD_LABEL = {"watcher": "SenseCAP Watcher"}
 
 
 def ask_port(p, wait=1.0):
@@ -1071,39 +1068,212 @@ def loud_wav(path, drive=2.2):
     return buf.getvalue()
 
 
-def say(text):
-    """Laesst alle Buddys mit Lautsprecher (Watcher, AMOLED) einen Satz sprechen (wenn "Vorlesen" an ist)."""
-    import threading
+_SAY_GEN = [0]  # zaehlt die Antworten: eine neue beendet das Vorlesen der alten
+
+
+# ---------------------------------------------------------------- Radio (Versuch)
+RADIO_API = "https://de1.api.radio-browser.info/json/stations/search"
+
+
+def radio_find(name):
+    """Sender im freien Verzeichnis radio-browser.info suchen. Liefert (name, stream-url) oder None. Nur MP3."""
+    import urllib.parse
     import urllib.request
+    q = {"name": name, "codec": "MP3", "limit": 20, "hidebroken": "true", "order": "clickcount", "reverse": "true"}
+    req = urllib.request.Request(RADIO_API + "?" + urllib.parse.urlencode(q), headers={"User-Agent": "ClaudeBuddy/1"})
+    try:
+        st = json.load(urllib.request.urlopen(req, timeout=10))
+    except Exception as e:  # noqa: BLE001
+        zlog("Radio-Suche: %r" % e)
+        return None
+    st = [x for x in st if x.get("url_resolved", "").startswith("http") and len(x["url_resolved"]) < 300]
+    if not st:
+        return None
+    best = sorted(st, key=lambda x: (x.get("bitrate", 0) < 64, -x.get("clickcount", 0)))[0]
+    import re
+    nm = re.split(r"\s*[|(\[]", best["name"].strip())[0].strip() or best["name"].strip()  # "Deutschlandfunk | DLF | MP3" -> "Deutschlandfunk"
+    return nm, best["url_resolved"]
+
+
+def radio_cmd(line):
+    """Befehl an den Watcher (per WLAN mit Schluessel, sonst ueber die normalen Wege)."""
+    import urllib.parse
+    import urllib.request
+    host = watcher_host()
+    if host:
+        try:
+            urllib.request.urlopen("http://%s/cmd?%s" % (host, urllib.parse.urlencode({"l": line})), timeout=5).read()
+            return True
+        except Exception:
+            pass
+    return send_line(line)
+
+
+def radio(name):
+    """Sender suchen und am Watcher abspielen; 'aus' stoppt. Liefert einen Text fuer die Anzeige."""
+    if not name or name.strip().lower() in ("aus", "stop", "stopp", "off", "ende"):
+        radio_cmd("RA")
+        return "Radio aus"
+    name = fix_place(name.strip())
+    tries = [name, name.replace(" ", "")]  # "radio eins", "radioeins"
+    if name.lower().startswith("radio "):
+        tries.append(name[6:])  # "Radio Fritz" heisst nur "Fritz"
+    hit = None
+    for n in tries:
+        hit = radio_find(n)
+        if hit:
+            break
+    if not hit:
+        return "Sender nicht gefunden: %s" % name
+    sname, url = hit
+    zlog("Radio: %s -> %s" % (sname, url))
+    radio_cmd("RA %s|%s" % (url, ascii_only(sname, 30)))
+    return "Radio: %s" % sname
+
+
+def fix_place(name):
+    """Aehnlich klingende Woerter zum eigenen Ort korrigieren (die Erkennung hoert "Cordbus" statt "Cottbus")."""
+    import difflib
+    ort = (load_cfg().get("ort") or "").split(",")[0].strip()
+    if not ort:
+        return name
+    out = []
+    for w in name.split():
+        r = difflib.SequenceMatcher(None, w.lower(), ort.lower()).ratio()
+        out.append(ort.lower() if r >= 0.7 and w.lower() != ort.lower() else w)
+    return " ".join(out)
+
+
+def whisper_hint():
+    """Hinweiswoerter fuer die Spracherkennung: feste Begriffe, Radio und der eigene Ort."""
+    ort = (load_cfg().get("ort") or "").split(",")[0].strip()
+    return WHISPER_HINT + " Spiel Radio, Sender, Radio aus." + (" %s." % ort if ort else "")
+
+
+def radio_voice(text):
+    """Sprachbefehl erkennen: 'spiel Radio Eins', 'Radio Fritz', 'mach das Radio aus', 'Musik aus'.
+    Liefert die Antwort (str), wenn es ein Radio-Befehl war, sonst None (dann geht der Text wie immer ins Fenster)."""
+    import re
+    t = re.sub(r"[.!?,\-]", " ", (text or "").lower()).strip()
+    t = re.sub(r"\b(spiele?|starte?|mach)(radio|musik)", r"\1 \2", t)  # "spielradio" -> "spiel radio"
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"^(computer\s+)?(bitte\s+)?", "", t)
+    if re.match(r"^((mach|schalt)\w*\s+)?(das\s+|die\s+)?(radio|musik)\s+(aus|stopp?|ab|leise)\s*(bitte)?$", t) or \
+            re.match(r"^(stopp?|aus)\s+(das\s+)?(radio|musik)$", t):
+        return radio("aus")
+    m = re.match(r"^(?:(?:spiel|spiele|mach|starte|schalte?)\w*\s+)?(?:mal\s+)?(?:das\s+)?(?:den\s+sender\s+|radio\s*)(.+?)(?:\s+an)?(?:\s+bitte)?$", t)
+    if m and (t.startswith(("spiel", "mach", "start", "schalt", "radio")) or "sender" in t):
+        name = m.group(1).strip()
+        if "sender" not in t:  # "Radio Eins": das Wort Radio gehoert oft zum Namen
+            name = "radio " + name
+        return radio(name)
+    m = re.match(r"^spiele?\s+(?:mal\s+)?(.{3,40}?)(?:\s+bitte)?$", t)  # "Spiel Antenne Brandenburg": nur wenn es den Sender gibt
+    if not m:  # zusammengeschrieben: "Spielantenne Brandenburg"
+        m = re.match(r"^spiele?([a-zäöü]{4,}(?:\s+\S+){0,3}?)(?:\s+bitte)?$", t)
+    if m and len(m.group(1).split()) <= 4:
+        name = fix_place(m.group(1))
+        if radio_find(name):
+            return radio(name)
+    return None
+
+
+def say_chunks(text, n=380):
+    """Text in Stuecke aus ganzen Saetzen (je etwa 25 s Sprache)."""
+    import re
+    out, cur = [], ""
+    for s in re.split(r"(?<=[.!?:])\s+", text):
+        while len(s) > n:  # ein einzelner Riesensatz: am Komma bzw. Wort teilen
+            cut = s[:n]
+            k = max(cut.rfind(", "), cut.rfind("; "))
+            k = k + 1 if k > n // 2 else (cut.rfind(" ") if " " in cut else n)
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(s[:k].strip())
+            s = s[k:].strip()
+        if cur and len(cur) + len(s) + 1 > n:
+            out.append(cur)
+            cur = ""
+        cur += (" " if cur else "") + s
+    if cur:
+        out.append(cur)
+    return [c for c in out if c.strip()]
+
+
+def _post_say(h, wav, neu):
+    """Ein Stueck an einen Buddy. Liefert 'ok', 'voll' oder ''."""
+    import urllib.request
+    bnd = "----buddysay%d" % int(time.time() * 1000)
+    body = (("--%s\r\nContent-Disposition: form-data; name=\"f\"; filename=\"sag.wav\"\r\n"
+             "Content-Type: audio/wav\r\n\r\n") % bnd).encode() + wav + ("\r\n--%s--\r\n" % bnd).encode()
+    req = urllib.request.Request("http://%s/say%s" % (h, "?neu=1" if neu else ""), data=body,
+                                 headers={"Content-Type": "multipart/form-data; boundary=" + bnd})
+    try:
+        r = urllib.request.urlopen(req, timeout=30).read()
+        return "ok" if r.startswith(b"ok") else ""
+    except urllib.error.HTTPError as e:
+        return "voll" if e.code == 503 else ""
+    except Exception:
+        return ""
+
+
+def say(text):
+    """Laesst alle Watcher die ganze Antwort sprechen (wenn "Vorlesen" an ist). Das erste Stueck geht sofort raus,
+    der Rest im Hintergrund: Claude Code wartet nie darauf. Eine neue Antwort bricht die alte ab."""
+    import threading
+    import urllib.error  # noqa: F401  (fuer _post_say)
     text = (text or "").strip()
     if not text or not load_cfg().get("vorlesen", True):
         return False
     hosts = mic_hosts()  # wer ein Mikrofon hat, hat auch einen Lautsprecher
     if not hosts:
         return False
-    wavs = {}
-    for h in hosts:  # jeder Buddy mit seiner Stimme; gleiche Stimmen nur einmal erzeugen
-        art = voice_for(h)
-        if art not in wavs:
-            wavs[art] = tts_wav(text, art)
-    ok = []
+    chunks = say_chunks(text)
+    if not chunks:
+        return False
+    _SAY_GEN[0] += 1
+    gen = _SAY_GEN[0]
+    cache = {}
 
-    def one(h):
-        wav = wavs[voice_for(h)]
-        bnd = "----buddysay%d" % int(time.time() * 1000)
-        body = (("--%s\r\nContent-Disposition: form-data; name=\"f\"; filename=\"sag.wav\"\r\n"
-                 "Content-Type: audio/wav\r\n\r\n") % bnd).encode() + wav + ("\r\n--%s--\r\n" % bnd).encode()
-        req = urllib.request.Request("http://%s/say" % h, data=body, headers={"Content-Type": "multipart/form-data; boundary=" + bnd})
-        try:
-            if urllib.request.urlopen(req, timeout=10).read().startswith(b"ok"):
-                ok.append(h)
-        except Exception:
-            pass
-    th = [threading.Thread(target=one, args=(h,)) for h in hosts]
+    def wav_for(i, art):
+        if (i, art) not in cache:
+            cache[(i, art)] = tts_wav(chunks[i], art)
+        return cache[(i, art)]
+
+    def dur(w):
+        return max(0.0, (len(w) - 44) / 32000.0)
+
+    def run_host(h, first_done):
+        art = voice_for(h)
+        ends = []  # wann jedes geschickte Stueck fertig gesprochen ist
+        for i in range(len(chunks)):
+            if _SAY_GEN[0] != gen:
+                break
+            w = wav_for(i, art)
+            if i >= 2:  # hoechstens eins wartet am Buddy: auf das Ende des vorletzten warten
+                time.sleep(max(0.0, ends[i - 2] - time.time() + 0.3))
+                if _SAY_GEN[0] != gen:
+                    break
+            for _ in range(20):
+                r = _post_say(h, w, neu=(i == 0))
+                if r != "voll":
+                    break
+                time.sleep(1.0)
+            if r != "ok":
+                break
+            start = max(time.time(), ends[-1] if ends else 0)
+            ends.append(start + dur(w))
+            if i == 0:
+                first_done.append(h)
+                ev.set()
+        ev.set()
+
+    ev = threading.Event()
+    ok = []
+    th = [threading.Thread(target=run_host, args=(h, ok), daemon=False) for h in hosts]
     for t in th:
         t.start()
-    for t in th:
-        t.join()
+    ev.wait(40)  # nur auf das erste Stueck warten
     return bool(ok)
 
 
@@ -1151,8 +1321,9 @@ def last_answer(ev):
     return ""
 
 
-def speakable(text, n=220):
-    """Ersten Satz (oder zwei kurze) einer Antwort fuer die Sprachausgabe aufbereiten."""
+def speakable(text, n=None):
+    """Antwort fuer die Sprachausgabe aufbereiten: ohne Code, Links und Markdown. Vorgelesen wird alles;
+    config "vorlesen_zeichen" (> 0) begrenzt auf ganze Saetze bis etwa so viele Zeichen."""
     import re
     t = re.sub(r"```.*?```", " ", text, flags=re.S)
     t = re.sub(r"`([^`]*)`", r"\1", t)
@@ -1160,14 +1331,18 @@ def speakable(text, n=220):
     t = re.sub(r"https?://\S+", "", t)
     t = re.sub(r"[*_#>|]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
+    if n is None:
+        n = int(load_cfg().get("vorlesen_zeichen", 0)) or 10 ** 9
     out = ""
-    for s in re.split(r"(?<=[.!?])\s+", t):
-        if len(out) + len(s) > n and out:
+    for s in re.split(r"(?<=[.!?:])\s+", t):
+        if len(out) + len(s) + 1 > n:
+            if not out:  # schon der erste Satz ist zu lang: am letzten Komma bzw. Wort davor enden
+                cut = s[:n]
+                k = max(cut.rfind(", "), cut.rfind("; "))
+                out = (cut[:k] if k > n // 2 else cut[:cut.rfind(" ")] if " " in cut else cut).rstrip(",;: ") + "."
             break
         out += (" " if out else "") + s
-        if len(out) > 60:
-            break
-    return out[:n]
+    return out
 
 
 def ask_knob(text, wait=None):
@@ -1647,7 +1822,7 @@ def foto_wlan(res="640", keep_on=False):
     hosts = list((cfg.get("devices") or {}).keys()) or ([cfg["host"]] if cfg.get("host") else [])
     r = FOTO_RES.get(str(res), 3)
     for ip in hosts:
-        try:  # das T-Display kennt /foto nicht (404) - dann den naechsten Buddy fragen
+        try:  # klappt es nicht, den naechsten Buddy fragen
             urllib.request.urlopen("http://%s/foto?r=%d%s" % (ip, r, "&an=1" if keep_on else ""), timeout=2).read()
         except Exception:
             continue
@@ -1764,13 +1939,13 @@ def set_options(ip, **kv):
 
 
 def mic_hosts():
-    """WLAN-Adressen aller Buddys mit Mikrofon (Watcher, AMOLED): die beantworten /rec."""
+    """WLAN-Adressen aller Watcher (mit Mikrofon): die beantworten /rec."""
     import urllib.request
     cfg = load_cfg()
     out = []
     for ip in list((cfg.get("devices") or {}).keys()) or ([cfg["host"]] if cfg.get("host") else []):
         r = ask_wlan(ip)
-        if not r or r[1] == "tdisplay":
+        if not r:
             continue
         try:
             with urllib.request.urlopen("http://%s/rec" % ip, timeout=1.5) as resp:
@@ -1963,7 +2138,7 @@ def protokoll(n=15):
 # erkennt den Text offline mit faster-whisper und fuegt ihn ins aktive Fenster ein (+ Enter).
 LOG_DIR = os.path.join(user_dir(), "claude-buddy")
 WHISPER_MODEL = "small"
-WHISPER_HINT = "Claude, Claude Code, Buddy, Watcher, ESP32, T-Display, PlatformIO, GitHub, Commit, Push, Firmware, Python."
+WHISPER_HINT = "Claude, Claude Code, Buddy, Watcher, SenseCAP, ESP32, PlatformIO, GitHub, Commit, Push, Firmware, Python."
 
 
 def zlog(msg):
@@ -2098,7 +2273,7 @@ def transcribe(model, wav):
         pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
     if len(pcm) < 1600:
         return ""
-    segs, _ = model.transcribe(pcm, language="de", beam_size=5, vad_filter=True, initial_prompt=WHISPER_HINT)
+    segs, _ = model.transcribe(pcm, language="de", beam_size=5, vad_filter=True, initial_prompt=whisper_hint())
     return " ".join(s.text.strip() for s in segs).strip()
 
 
@@ -2250,7 +2425,12 @@ def zuhoeren(args):
                     show = ascii_only(text, 66)
                     urllib.request.urlopen("http://%s/cmd?%s" % (host, urllib.parse.urlencode({"l": "R " + show if show else "R"})), timeout=3).read()
                     if text:
-                        type_text(text, enter)
+                        r = radio_voice(text)  # "Computer, spiel Radio Eins" steuert das Radio statt zu tippen
+                        if r is not None:
+                            zlog(r)
+                            urllib.request.urlopen("http://%s/cmd?%s" % (host, urllib.parse.urlencode({"l": "R " + ascii_only(r, 66)})), timeout=3).read()
+                        else:
+                            type_text(text, enter)
             except KeyboardInterrupt:
                 return
             except Exception as e:  # WLAN-Aussetzer (z.B. Hand ueber der Antenne) oder Buddy startet neu
@@ -2359,6 +2539,8 @@ if __name__ == "__main__":
         zeitraffer(sys.argv[2:])
     elif cmd == "ton":
         ton(sys.argv[2:])
+    elif cmd == "radio":  # Internetradio am Watcher: radio <sender> | radio aus
+        print(radio(" ".join(sys.argv[2:])))
     elif cmd == "sag":  # Watcher etwas sagen lassen (Test der Stimme)
         print("ok" if say(" ".join(sys.argv[2:]) or "Hallo, ich bin dein Claude-Buddy.") else "nicht geklappt (Watcher im WLAN? Vorlesen an?)")
     elif cmd == "frage":  # Freigabe am Knopf testen

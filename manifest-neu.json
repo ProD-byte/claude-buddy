@@ -1,6 +1,6 @@
 {
-  "name": "Claude-Buddy (Neuinstallation)",
-  "version": "15",
+  "name": "Claude-Buddy SenseCAP Watcher (Neuinstallation)",
+  "version": "16",
   "new_install_prompt_erase": false,
   "builds": [
     {

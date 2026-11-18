@@ -1,44 +1,33 @@
 # Claude-Buddy
 
-Ein kleiner Begleiter auf dem **LILYGO T-Display-S3**, der zeigt, was **Claude Code** gerade macht:
+Ein kleiner Begleiter auf dem **SenseCAP Watcher W1-A**, der zeigt, was **Claude Code** gerade macht:
 denken, lesen, schreiben, Terminal, suchen, Internet, Helfer, Frage an dich, fertig – mit Animationen,
-einer WS2812B-LED hinter einem weißen Diffusor und leisen Tönen aus einem passiven Buzzer.
+Tönen aus dem Lautsprecher und einer LED. Freigaben bestätigst du am Drehknopf, Sprache nimmt er per Knopfdruck an,
+und am Rand zeigen zwei Bögen, wie viel vom 5-Stunden- und Wochenlimit verbraucht ist und wann es zurückgesetzt wird.
 Im Leerlauf spielt er Jo-Jo, liest, gießt seine Pflanze (sie wächst mit jeder erledigten Aufgabe) oder pustet Seifenblasen.
 
 *Inoffizielles Bastelprojekt, kein Produkt von Anthropic.*
 
-**Simulation, Flasher und Anleitung:** https://prod-byte.github.io/claude-buddy/ · [daveslab.de/basteln](https://daveslab.de/basteln/)
+**Simulation, Programm, Flasher und Handbuch:** https://prod-byte.github.io/claude-buddy/ · [daveslab.de/basteln](https://daveslab.de/basteln/)
 
 ## In drei Schritten
 
-1. **Firmware** über den Browser-Flasher auf der Seite oben aufspielen (Chrome oder Edge, USB-C).
-2. **PC:** Python installieren, [`buddy.py`](buddy.py) herunterladen, dann
-   ```
-   pip install pyserial pillow
-   python buddy.py install
-   ```
-   Das trägt Hooks in `~/.claude/settings.json` ein (eine Sicherung wird angelegt). Entfernen: `python buddy.py uninstall`.
-3. **Optional WLAN:** am Gerät beide Tasten 2 s halten → mit dem Handy ins WLAN „Claude-Buddy“ → eigenes WLAN wählen.
-   Dann kommt alles auch ohne USB-Datenverbindung an.
-
-## Anschlüsse (optional)
-
-| Bauteil | Anschluss |
-|---|---|
-| Passiver Buzzer (9 mm) | + an IO16, − an GND |
-| WS2812B-LED | DIN über 330 Ω an IO13, 5V, GND |
+1. **Programm** laden: [Windows](https://github.com/ProD-byte/claude-buddy/releases/latest/download/ClaudeBuddySetup.exe)
+   oder Linux (AppImage, siehe Seite oben).
+2. **Watcher** per USB (unterer Anschluss) anstecken: Der Assistent spielt die Firmware auf, bringt ihn ins WLAN,
+   koppelt ihn und verbindet Claude Code.
+3. **Claude Code** neu starten – ab dann meldet jede Sitzung dem Buddy, was sie tut.
 
 ## Bedienung
 
-- **IO0** kurz: anstupsen · lang: stumm
-- **IO14** kurz: Info / „gesehen“ · lang: Einstellungen (Lautstärke, Ticks, LED, Display-Helligkeit, Bild drehen)
-- **beide 2 s:** WLAN per Handy einrichten
+- **Drehknopf drücken:** ja / anstupsen · **Doppelklick:** Menü · **halten:** sprechen
+- **Drehen:** im Menü wählen, bei Fragen „nein“
+- **Display:** streicheln oder antippen
 
-Im WLAN holt sich der Buddy neue Versionen nachts von selbst (abschaltbar in den Einstellungen, dort auch „Jetzt aktualisieren“ und die Sprache Deutsch/Englisch).
-Laufen mehrere Claude-Code-Sitzungen gleichzeitig, zeigen kleine Mini-Buddys oben die anderen Projekte; Fragen und Erlaubnisse haben immer Vorrang.
-Er erkennt `git commit`/`git push`, Bauen, Aufspielen, Tests (grün/rot), Löschen, Aufgabenlisten und zeigt Screenshots von Claude kurz als Polaroid (abschaltbar).
+Im WLAN holt sich der Buddy neue Versionen nachts von selbst (abschaltbar im Menü, dort auch „Jetzt aktualisieren“
+und die Sprache Deutsch/Englisch).
 
 ## English
 
-A little companion on the LILYGO T-Display-S3 that shows what Claude Code is doing. Flash the firmware from the page above,
-then run `pip install pyserial pillow` and `python buddy.py install` on your PC. Display language German or English (settings). Over Wi-Fi it updates itself at night.
+A little companion on the SenseCAP Watcher that shows what Claude Code is doing. Install the app (Windows or Linux),
+plug in the Watcher and follow the wizard. Display language German or English. Over Wi-Fi it updates itself at night.
