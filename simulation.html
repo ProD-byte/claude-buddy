@@ -16,27 +16,28 @@ main{max-width:1040px;margin:0 auto;padding-block:16px 32px;padding-left:max(16p
 button:focus-visible,input:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
 h1{font-size:22px;margin:4px 0 2px}
 .lead{color:var(--mute);margin:0 0 16px}
-/* Geraet: SenseCAP Watcher - helles Gehaeuse, rundes Display, Drehknopf rechts oben */
+/* Ausschnitt x 300..1060, y 130..950 des 1400x1050-Fotos; Display Mitte (700|551) r 250, aktiv 95 %. Geraet: Foto des echten SenseCAP Watcher (Seeed Studio), die Simulation liegt genau auf seinem Display */
 .stage{display:grid;place-items:center;padding-block:8px 4px}
-.dev{position:relative;width:min(88%,440px);aspect-ratio:1;border-radius:22%;
-  background:radial-gradient(120% 120% at 30% 20%,#f7f6f3 0,#e4e2dd 55%,#cfccc5 100%);
-  box-shadow:inset 0 2px 0 rgba(255,255,255,.7),inset 0 -6px 14px rgba(0,0,0,.12),0 18px 30px rgba(0,0,0,.35),0 3px 6px rgba(0,0,0,.25)}
-.bezel{position:absolute;inset:7%;border-radius:50%;background:#0b0b0c;box-shadow:inset 0 0 0 3px #1c1c1e,0 1px 0 rgba(255,255,255,.6)}
-.glass{position:absolute;inset:3.2%;border-radius:50%;overflow:hidden;background:#000;touch-action:none;cursor:grab}
+.dev{position:relative;width:min(80%,420px);aspect-ratio:760/820;border-radius:22px;
+  background:#fff url("https://media-cdn.seeedstudio.com/cdn-cgi/image/format=auto%2Cwidth=1200%2Cquality=85/media/catalog/product/cache/961a49e1875f8c1f40e5990d74e68365/3/-/3-113991315-sensecap-watcher-w1-a-font_1.jpg") 46.875% 56.52% / 184.21% auto no-repeat;
+  box-shadow:0 14px 30px rgba(0,0,0,.35),0 3px 6px rgba(0,0,0,.2)}
+.glass{position:absolute;left:21.43%;top:22.43%;width:62.39%;height:57.83%;border-radius:50%;overflow:hidden;background:#000;
+  touch-action:none;cursor:grab}
 .screen{display:block;width:100%;height:100%}
 .dim{position:absolute;inset:0;background:#000;pointer-events:none}
-.ledpt{position:absolute;left:50%;top:2.6%;width:2.6%;aspect-ratio:1;translate:-50% 0;border-radius:50%;background:#bdb9b1;
-  box-shadow:inset 0 1px 1px rgba(0,0,0,.3);transition:box-shadow .08s}
-.knob{position:absolute;right:-3.4%;top:9%;width:6.5%;height:18%;border:0;padding:0;border-radius:40%/14%;cursor:pointer;
-  background:repeating-linear-gradient(#9b978f 0 3px,#c9c5bd 3px 6px);box-shadow:inset -3px 0 4px rgba(0,0,0,.25),0 2px 4px rgba(0,0,0,.3);
-  touch-action:none;user-select:none;-webkit-user-select:none;transition:transform .08s}
+.ledpt{position:absolute;left:32.63%;top:12.44%;width:3.7%;aspect-ratio:1;translate:-50% -50%;border-radius:50%;pointer-events:none;
+  transition:box-shadow .08s}
+.knob{position:absolute;left:72.37%;top:7.32%;width:11.84%;height:13.41%;border:0;padding:0;border-radius:30%;cursor:pointer;
+  background:transparent;touch-action:none;user-select:none;-webkit-user-select:none;transition:background .08s,box-shadow .15s}
 .knob:hover{box-shadow:0 0 0 2px rgba(217,119,87,.8),0 0 14px rgba(217,119,87,.5)}
-.knob.down{transform:translateX(-18%)}
-.turn{position:absolute;right:-12%;width:8%;aspect-ratio:1;border-radius:50%;border:1px solid var(--line);background:var(--card);color:var(--ink);
+.knob.down{background:rgba(0,0,0,.25)}
+.turn{position:absolute;left:104%;width:9%;aspect-ratio:1;border-radius:50%;border:1px solid var(--line);background:var(--card);color:var(--ink);
   font-size:12px;line-height:1;cursor:pointer;padding:0}
 .turn:hover{border-color:var(--acc)}
-#tUp{top:8%}
-#tDn{top:19%}
+#tUp{top:4%}
+#tDn{top:14%}
+.foto{font-size:11px;color:var(--mute);text-align:center;margin-top:6px}
+.foto a{color:inherit}
 .legende{display:flex;flex-wrap:wrap;justify-content:center;gap:4px 22px;margin-top:10px;font:12px ui-monospace,Consolas,monospace;color:var(--mute)}
 .legende b{color:var(--ink);font-weight:600}
 .hint{color:var(--mute);font-size:13px;margin:8px 2px 0}
@@ -63,11 +64,16 @@ kbd{border:1px solid var(--line);border-radius:4px;padding:0 5px;font-size:12px}
 
 <div class="stage"><div class="dev">
   <div class="ledpt" id="led" aria-hidden="true"></div>
-  <div class="bezel"><div class="glass" id="glass">
+  <div class="glass" id="glass">
     <canvas id="scr" class="screen" width="412" height="412" aria-label="Simuliertes rundes Display des Claude-Buddys"></canvas>
     <div class="dim" id="dim"></div>
     <div class="loading" id="loading" data-i="laden">Buddy wacht auf …</div>
-  </div></div>
+  </div>
+  <button class="turn" id="tUp" title="drehen (nach oben)" aria-label="Knopf nach oben drehen">▲</button>
+  <button class="knob" id="knob" title="Drehknopf: drücken = ja / anstupsen, halten = sprechen, Doppelklick = Menü, Mausrad = drehen" aria-label="Drehknopf"></button>
+  <button class="turn" id="tDn" title="drehen (nach unten)" aria-label="Knopf nach unten drehen">▼</button>
+</div></div>
+<p class="foto" data-i="foto">Foto: <a href="https://www.seeedstudio.com/SenseCAP-Watcher-W1-A-p-5979.html" target="_blank" rel="noopener">Seeed Studio</a> (SenseCAP Watcher W1-A, Clear)</p>
   <button class="turn" id="tUp" title="drehen (nach oben)" aria-label="Knopf nach oben drehen">▲</button>
   <button class="knob" id="knob" title="Drehknopf: drücken = ja / anstupsen, halten = sprechen, Doppelklick = Menü, Mausrad = drehen" aria-label="Drehknopf"></button>
   <button class="turn" id="tDn" title="drehen (nach unten)" aria-label="Knopf nach unten drehen">▼</button>
@@ -232,7 +238,7 @@ function frame(t) {
   // Hintergrundlicht und LED
   dimEl.style.opacity = (1 - (0.2 + 0.8 * ex.sim_backlight() / 255)).toFixed(3);
   const c = ex.sim_led(), r = c >> 16 & 255, g = c >> 8 & 255, b = c & 255, m = Math.max(r, g, b);
-  if (m < 3) { ledEl.style.boxShadow = ''; ledEl.style.background = ''; }
+  if (m < 3) { ledEl.style.boxShadow = 'none'; ledEl.style.background = 'transparent'; }
   else {
     const k = 255 / m, a = Math.min(1, m / 140), col = `${Math.round(r * k)},${Math.round(g * k)},${Math.round(b * k)}`;
     ledEl.style.background = `rgb(${col})`;
@@ -368,6 +374,7 @@ const EN = {
   lead: 'Simulation of the SenseCAP Watcher running exactly the same code as the device, compiled to WebAssembly. Unofficial hobby project, not a product of Anthropic.',
   laden: 'Buddy is waking up …',
   leg: '<span><b>Knob</b> press: yes · poke · double click = menu</span><span><b>Turn</b> (mouse wheel, ▲▼): menu · no</span><span><b>Display</b> stroke or tap</span>',
+  foto: 'Photo: <a href="https://www.seeedstudio.com/SenseCAP-Watcher-W1-A-p-5979.html" target="_blank" rel="noopener">Seeed Studio</a> (SenseCAP Watcher W1-A, Clear)',
   li_h: 'Usage limits (arcs at the edge)', li5: '5 hours', liw: 'Week',
   li_p: 'On the real device the values come from the Claude Code status line: left the 5-hour limit, right the weekly limit, below when it resets.',
   auto_h: 'Automatic', demo: 'Play an example session', ton: 'Sound (speaker)',
