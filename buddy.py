@@ -62,7 +62,23 @@ CH342_VID, CH342_PID = 0x1A86, 0x55D2  # SenseCAP Watcher: Kanal x.2 = ESP32-S3 
 SCAN_EVERY = 20  # s: so oft nach neu angesteckten Buddys suchen
 
 
-def load_cfg():
+class Cfg(dict):
+    """config.json als dict. Merkt sich den gelesenen Stand, damit save_cfg nur die eigenen Aenderungen schreibt."""
+    _orig = None
+
+
+_CFG_LOCK = None
+
+
+def _cfg_lock():
+    global _CFG_LOCK
+    if _CFG_LOCK is None:
+        import threading
+        _CFG_LOCK = threading.RLock()
+    return _CFG_LOCK
+
+
+def _read_cfg():
     try:
         with open(CFG_FILE, encoding="utf-8") as f:
             return json.load(f)
@@ -70,12 +86,39 @@ def load_cfg():
         return {}
 
 
+def load_cfg():
+    import copy
+    c = Cfg(_read_cfg())
+    c._orig = copy.deepcopy(dict(c))
+    return c
+
+
 def save_cfg(cfg):
-    try:
-        with open(CFG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-    except Exception:
-        pass
+    """Nur die Schluessel schreiben, die sich seit load_cfg() geaendert haben, auf den aktuellen Stand der Datei.
+    So ueberschreibt ein Teil des Programms mit einer alten Kopie nie, was ein anderer inzwischen gespeichert hat
+    (z.B. "Sprechen per Knopf" aus dem Menue, waehrend ein Hook seine Zustaende speichert)."""
+    import copy
+    with _cfg_lock():
+        if isinstance(cfg, Cfg) and cfg._orig is not None:
+            cur = _read_cfg()
+            orig = cfg._orig
+            for k in set(cfg) | set(orig):
+                if k not in cfg:
+                    cur.pop(k, None)
+                elif k not in orig or cfg[k] != orig[k]:
+                    cur[k] = cfg[k]
+            data = cur
+        else:
+            data = dict(cfg)
+        try:
+            tmp = CFG_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, CFG_FILE)
+        except Exception:
+            pass
+        if isinstance(cfg, Cfg):  # weiter benutzbar: ab jetzt gilt der gespeicherte Stand als gelesen
+            cfg._orig = copy.deepcopy(dict(cfg))
 
 
 # ---------------------------------------------------------------- Kopplung (Schluessel statt Passwort)

@@ -1,6 +1,6 @@
 {
   "name": "Claude-Buddy AMOLED 1.75C (Neuinstallation)",
-  "version": "14",
+  "version": "15",
   "new_install_prompt_erase": false,
   "builds": [
     {
