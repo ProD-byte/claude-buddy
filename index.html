@@ -23,7 +23,7 @@ iframe{display:block;width:100%;height:1700px;border:0;margin-top:16px}
 </head>
 <body><main>
 <h1>Claude-Buddy</h1>
-<p class="mute"><span data-i="for">Ein kleiner Begleiter auf dem SenseCAP Watcher, der zeigt, was Claude Code gerade macht.</span> · Build 16 ·
+<p class="mute"><span data-i="for">Ein kleiner Begleiter auf dem SenseCAP Watcher, der zeigt, was Claude Code gerade macht.</span> · Version 1.00 ·
 <span data-i="inof">Inoffizielles Bastelprojekt, kein Produkt von Anthropic.</span></p>
 
 <div class="box">
@@ -50,7 +50,8 @@ iframe{display:block;width:100%;height:1700px;border:0;margin-top:16px}
 <div class="box">
 <h2 data-i="hh">📖 Handbuch</h2>
 <p data-i="hp">Wie alles funktioniert: Geräte, Bedienung, Sprechen und Vorlesen, Kopplung, sichere Updates, Fehlersuche.</p>
-<p><a class="btn" href="Claude-Buddy-Handbuch.pdf" target="_blank" data-i="hb">Handbuch öffnen (PDF)</a></p>
+<p><a class="btn" href="Claude-Buddy-Handbuch.pdf" target="_blank">Handbuch (Deutsch, PDF)</a>
+<a class="btn" href="Claude-Buddy-Manual.pdf" target="_blank">Manual (English, PDF)</a></p>
 </div>
 
 <div class="box">
@@ -65,19 +66,6 @@ iframe{display:block;width:100%;height:1700px;border:0;margin-top:16px}
 <p class="mute" data-i="fh2">Danach aktualisiert sich der Watcher selbst über das WLAN.</p>
 </div>
 
-<div class="box">
-<h2 data-i="lh">🐧 Linux-Programm</h2>
-<p data-i="lp">Dasselbe Programm für Linux als AppImage – eine Datei, keine Installation. Stimmen: Kerstin und Thorsten (Piper, offline).</p>
-<p><a class="btn" href="https://github.com/ProD-byte/claude-buddy/releases/latest/download/ClaudeBuddy-x86_64.AppImage" data-i="lb1">⬇ PC / Laptop (x86_64)</a>
-<a class="btn" href="https://github.com/ProD-byte/claude-buddy/releases/latest/download/ClaudeBuddy-aarch64.AppImage" data-i="lb2">⬇ Raspberry Pi (ARM64)</a></p>
-<ol>
-<li data-i="l1">Ausführbar machen und starten: <code>chmod +x ClaudeBuddy-*.AppImage</code>, dann doppelklicken.</li>
-<li data-i="l2">Zugriff auf USB einmalig erlauben: <code>sudo usermod -aG dialout $USER</code>, danach ab- und wieder anmelden.</li>
-<li data-i="l3">Für Sprechen per Knopf: <code>xdotool</code> (X11) bzw. <code>wtype</code> (Wayland) installieren. GNOME zeigt das Symbol neben der Uhr mit der Erweiterung „AppIndicator“.</li>
-</ol>
-<p class="mute" data-i="lp2">Ganz ohne Programm geht auch das PC-Skript: <a href="buddy.py" download>buddy.py</a> mit <code>pip install pyserial pillow</code> und <code>python3 buddy.py install</code>.</p>
-</div>
-
 <iframe id="sim" src="simulation.html" title="Claude-Buddy Simulation"></iframe>
 <script>
 if (!(navigator.language || 'de').toLowerCase().startsWith('de')) {
@@ -87,18 +75,12 @@ if (!(navigator.language || 'de').toLowerCase().startsWith('de')) {
     ah: '💻 Windows app', ap: 'One installer does it all: plug in the buddy – the wizard flashes it if needed, brings it onto your Wi-Fi, pairs it, downloads speech recognition and connects Claude Code. Afterwards it sits next to the clock and keeps itself and the buddies up to date.',
     ab: '⬇ Download ClaudeBuddySetup.exe', a1: 'Run the installer (no admin rights). If Windows warns (“Windows protected your PC”): <b>More info → Run anyway</b>.',
     a2: 'Plug in the buddy via USB and click through the setup wizard.', a3: 'Restart Claude Code – from then on every session tells the buddy what it is doing.',
-    hh: '📖 Manual (German)', hp: 'How it all works: devices, controls, talking and reading aloud, pairing, safe updates, troubleshooting.', hb: 'Open manual (PDF)',
+    hh: '📖 Manual', hp: 'How it all works: devices, controls, talking and reading aloud, pairing, safe updates, troubleshooting.', hb: 'Open manual (PDF)',
     fh: '⚡ Firmware in the browser', fp: 'Without the app, straight from Chrome or Edge. Plug the Watcher into its lower USB port.',
     up: 'Update: settings and Wi-Fi are kept. Do <b>not</b> tick “Erase device?”.', upb: '⚡ Install update',
     uns: 'Please use Chrome or Edge on a computer.', uns2: 'Please use Chrome or Edge on a computer.',
     neup: 'Fresh install: erases everything – for new devices or when nothing works anymore.', neub: '🗑️ Erase &amp; install',
-    fh2: 'Afterwards the Watcher updates itself over Wi-Fi.',
-    lh: '🐧 Linux app', lp: 'The same app for Linux as an AppImage – one file, no installation. Voices: Kerstin and Thorsten (Piper, offline).',
-    lb1: '⬇ PC / laptop (x86_64)', lb2: '⬇ Raspberry Pi (ARM64)',
-    l1: 'Make it executable and start it: <code>chmod +x ClaudeBuddy-*.AppImage</code>, then double-click.',
-    l2: 'Allow USB access once: <code>sudo usermod -aG dialout $USER</code>, then log out and back in.',
-    l3: 'For talking by button: install <code>xdotool</code> (X11) or <code>wtype</code> (Wayland). On GNOME the tray icon needs the “AppIndicator” extension.',
-    lp2: 'Without any app there is still the PC script: <a href="buddy.py" download>buddy.py</a> with <code>pip install pyserial pillow</code> and <code>python3 buddy.py install</code>.'};
+    fh2: 'Afterwards the Watcher updates itself over Wi-Fi.'};
   document.documentElement.lang = 'en';
   document.querySelectorAll('[data-i]').forEach(e => { if (TX[e.dataset.i]) e.innerHTML = TX[e.dataset.i]; });
   document.getElementById('sim').src = 'simulation.html?lang=en';

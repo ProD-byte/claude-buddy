@@ -1,6 +1,6 @@
 {
   "name": "Claude-Buddy SenseCAP Watcher (Update)",
-  "version": "16",
+  "version": "1.00",
   "new_install_prompt_erase": true,
   "builds": [
     {

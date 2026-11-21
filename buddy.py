@@ -92,6 +92,46 @@ def load_cfg():
     return c
 
 
+_SPRACHE = []
+
+
+def lang():
+    """Sprache der Oberflaeche und der Stimme: "de" oder "en". Aus config.json ("sprache"), sonst die Windows-Sprache."""
+    if not _SPRACHE:
+        s = _read_cfg().get("sprache")
+        if s not in ("de", "en"):
+            s = "en"
+            try:
+                if os.name == "nt":
+                    import ctypes
+                    if ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF == 0x07:  # Deutsch
+                        s = "de"
+                else:
+                    import locale
+                    if (locale.getlocale()[0] or os.environ.get("LANG", "")).lower().startswith("de"):
+                        s = "de"
+            except Exception:
+                s = "de"
+        _SPRACHE.append(s)
+    return _SPRACHE[0]
+
+
+def set_lang(s):
+    cfg = load_cfg()
+    cfg["sprache"] = "en" if s == "en" else "de"
+    save_cfg(cfg)
+    _SPRACHE[:] = [cfg["sprache"]]
+    try:
+        _voices_fuer_sprache()
+    except NameError:  # beim Laden des Moduls noch nicht definiert
+        pass
+
+
+def L(de, en):
+    """Text in der eingestellten Sprache."""
+    return en if lang() == "en" else de
+
+
 def save_cfg(cfg):
     """Nur die Schluessel schreiben, die sich seit load_cfg() geaendert haben, auf den aktuellen Stand der Datei.
     So ueberschreibt ein Teil des Programms mit einer alten Kopie nie, was ein anderer inzwischen gespeichert hat
@@ -415,6 +455,15 @@ def find_ports():
         return []
 
 
+def fw_name(v):
+    """Firmware-Version zum Anzeigen: Build 17 = "1.00", 18 = "1.01" ...; aeltere bleiben "v16"."""
+    try:
+        b = int(str(v).lstrip("v"))
+    except Exception:
+        return str(v)
+    return "%d.%02d" % (1 + (b - 17) // 100, (b - 17) % 100) if b >= 17 else "v%d" % b
+
+
 BOARDS = {}  # Port oder IP -> Geraeteart aus der Antwort auf "?" ("watcher")
 BOARD_LABEL = {"watcher": "SenseCAP Watcher"}
 
@@ -514,6 +563,38 @@ def _write_port(p, data, chunked=False):
                 continue
             return False
     return False
+
+
+def usb_ask(line, wait=1.5, until=None):
+    """Eine Befehlszeile per USB schicken und die Antwort lesen (z. B. "O", "RA?"). None ohne USB-Buddy."""
+    for p in usb_ports(load_cfg()) or find_ports():
+        for _ in range(20):
+            try:
+                s = open_port(p)
+                break
+            except Exception as e:  # noqa: BLE001
+                if "PermissionError" in repr(e) or "Zugriff" in str(e):
+                    time.sleep(0.05)
+                    continue
+                s = None
+                break
+        else:
+            s = None
+        if not s:
+            continue
+        try:
+            s.reset_input_buffer()
+            s.write((line + "\n").encode("ascii", "replace"))
+            s.flush()
+            t, buf = time.time(), b""
+            while time.time() - t < wait:
+                buf += s.read(256)
+                if until and until.encode() in buf and b"\n" in buf.split(until.encode(), 1)[1]:
+                    break
+            return buf.decode("utf-8", "replace")
+        finally:
+            s.close()
+    return None
 
 
 def send_usb(data, chunked=False):
@@ -882,8 +963,20 @@ def tool_state(name, inp):
 # ----------------------------------------------------------------- Vorlesen, Freigabe am Knopf, Ball werfen
 # Stimmen: die neueren Windows-Stimmen (WinRT/OneCore) klingen natuerlicher und es gibt Mann und Frau.
 # Fehlen sie, wird die klassische Stimme (System.Speech, z.B. Hedda) genommen.
-VOICES = {"frau": "Microsoft Katja", "mann": "Microsoft Stefan"}
-VOICE_LABEL = {"frau": "Frau (Katja)", "mann": "Mann (Stefan)"}
+VOICES_DE = {"frau": "Microsoft Katja", "mann": "Microsoft Stefan"}
+VOICES_EN = {"frau": "Microsoft Zira", "mann": "Microsoft David"}
+VOICE_LABEL_DE = {"frau": "Frau (Katja)", "mann": "Mann (Stefan)"}
+VOICE_LABEL_EN = {"frau": "Female (Zira)", "mann": "Male (David)"}
+CLASSIC_EN = {"frau": "Microsoft Zira Desktop", "mann": "Microsoft David Desktop"}  # aeltere Windows-Stimmen
+VOICES, VOICE_LABEL = VOICES_DE, VOICE_LABEL_DE
+
+
+def _voices_fuer_sprache():
+    """Stimmen und Namen passend zur eingestellten Sprache (nach einem Sprachwechsel neu setzen)."""
+    global VOICES, VOICE_LABEL
+    en = lang() == "en"
+    VOICES = VOICES_EN if en else VOICES_DE
+    VOICE_LABEL = VOICE_LABEL_EN if en else VOICE_LABEL_DE
 WINRT_TTS = r"""
 param([string]$TextFile, [string]$OutFile, [string]$Voice, [double]$Rate)
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
@@ -912,6 +1005,7 @@ PIPER_VOICES = {"mann": ("de_DE-thorsten-medium", "de/de_DE/thorsten/medium"),
                 "frau": ("de_DE-kerstin-low", "de/de_DE/kerstin/low")}
 PIPER_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/%s/%s%s"
 _PIPER = {}
+_voices_fuer_sprache()
 if os.name != "nt":
     VOICE_LABEL = {"frau": "Frau (Kerstin)", "mann": "Mann (Thorsten)"}
 
@@ -1038,8 +1132,11 @@ def tts_wav(text, art=None):
     except Exception:
         pass
     stimme = load_cfg().get("stimme", "Microsoft Hedda Desktop")  # klassische Stimme als Rueckfall
+    if lang() == "en":
+        stimme = CLASSIC_EN.get(art, CLASSIC_EN["frau"])  # fehlt David, nimmt SelectVoice die Standardstimme
     ps = ("Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-          "try { $s.SelectVoice('%s') } catch {}; $s.Rate = 1; "
+          "try { $s.SelectVoice('%s') } catch { $v = $s.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Culture.Name -like '"
+          + lang() + "*' } | Select-Object -First 1; if ($v) { $s.SelectVoice($v.VoiceInfo.Name) } }; $s.Rate = 1; "
           "$f = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, "
           "[System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono); "
           "$s.SetOutputToWaveFile('%s', $f); $s.Speak([IO.File]::ReadAllText('%s', [Text.Encoding]::UTF8)); $s.Dispose()") % (stimme, wp, tp)
@@ -1095,6 +1192,441 @@ def radio_find(name):
     return nm, best["url_resolved"]
 
 
+# ---------------------------------------------------------------- Nutzungslimits von Claude (5 Stunden / Woche)
+# Auf Wunsch des Nutzers: mit dem Anmelde-Schluessel, den Claude Code in ~/.claude/.credentials.json ablegt.
+# Der Schluessel geht nur an Anthropic (wie bei Claude Code selbst), wird nie protokolliert und nie an den Watcher geschickt.
+CLAUDE_CREDS = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
+CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # oeffentliche Kennung von Claude Code (OAuth)
+CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+def _claude_oauth():
+    try:
+        with open(CLAUDE_CREDS, encoding="utf-8") as f:
+            d = json.load(f)
+        return d, d.get("claudeAiOauth") or {}
+    except Exception:
+        return None, {}
+
+
+class _claude_lock:
+    """Einfache Sperrdatei neben der Anmeldung (mehrere Buddy-Teile im selben Moment)."""
+    P = CLAUDE_CREDS + ".buddy.lock"
+
+    def __enter__(self):
+        t = time.time()
+        while time.time() - t < 15:
+            try:
+                self.fd = os.open(self.P, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(self.P) > 60:  # liegengeblieben
+                        os.remove(self.P)
+                        continue
+                except OSError:
+                    pass
+                time.sleep(0.3)
+        self.fd = None
+        return self
+
+    def __exit__(self, *a):
+        if self.fd is not None:
+            os.close(self.fd)
+            try:
+                os.remove(self.P)
+            except OSError:
+                pass
+
+
+def _claude_refresh(d, o):
+    """Abgelaufenen Schluessel erneuern wie Claude Code und zurueckschreiben (damit Claude Code angemeldet bleibt)."""
+    import urllib.request
+    body = json.dumps({"grant_type": "refresh_token", "refresh_token": o["refreshToken"], "client_id": CLAUDE_CLIENT_ID,
+                       "scope": " ".join(o.get("scopes") or [])}).encode()
+    req = urllib.request.Request(CLAUDE_TOKEN_URL, data=body, headers={
+        "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "claude-buddy"})  # ohne eigene Kennung blockt Cloudflare (1010)
+    r = json.load(urllib.request.urlopen(req, timeout=20))
+    o["accessToken"] = r["access_token"]
+    if r.get("refresh_token"):
+        o["refreshToken"] = r["refresh_token"]
+    o["expiresAt"] = int((time.time() + int(r.get("expires_in", 3600))) * 1000)
+    d["claudeAiOauth"] = o
+    tmp = CLAUDE_CREDS + ".buddy.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f)
+    os.replace(tmp, CLAUDE_CREDS)
+    zlog("Claude-Anmeldung erneuert")
+    return o
+
+
+def claude_usage():
+    """{'5h': (prozent, reset-epoch), 'woche': (prozent, reset-epoch)} oder ein Text, warum es nicht geht."""
+    import urllib.error
+    import urllib.request
+    from datetime import datetime
+    d, o = _claude_oauth()
+    if not o.get("accessToken"):
+        return "Claude Code ist nicht angemeldet (einmal im Terminal: claude, dann /login)"
+
+    def frisch(x):
+        return x.get("expiresAt", 0) / 1000 - time.time() > 600
+    try:
+        if not frisch(o) and o.get("refreshToken"):
+            # Erneuern gibt einen neuen Erneuerungsschluessel aus, der alte wird ungueltig. Damit sich Buddy und
+            # Claude Code nicht gegenseitig aussperren: unter Sperre unmittelbar davor neu lesen - hat Claude Code
+            # schon erneuert, dessen Schluessel nehmen statt selbst zu erneuern.
+            with _claude_lock():
+                d, o = _claude_oauth()
+                if not frisch(o):
+                    try:
+                        o = _claude_refresh(d, o)
+                    except urllib.error.HTTPError as e:
+                        time.sleep(2)
+                        d, o = _claude_oauth()  # vielleicht kam Claude Code gerade zuvor
+                        if not frisch(o):
+                            if e.code in (400, 401):
+                                return "Anmeldung abgelaufen – Claude Code einmal neu anmelden (claude, /login)"
+                            raise
+        req = urllib.request.Request(CLAUDE_USAGE_URL, headers={
+            "Authorization": "Bearer " + o["accessToken"], "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-buddy", "Content-Type": "application/json"})
+        r = json.load(urllib.request.urlopen(req, timeout=15))
+    except urllib.error.HTTPError as e:
+        return "Anthropic antwortet %d" % e.code  # ohne Schluessel im Text
+    except Exception as e:  # noqa: BLE001
+        return "Verbrauch nicht abrufbar (%s)" % type(e).__name__
+
+    def eintrag(x):
+        if not isinstance(x, dict) or x.get("utilization") is None:
+            return None
+        t = 0
+        try:
+            t = datetime.fromisoformat(str(x.get("resets_at")).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            pass
+        return (int(round(float(x["utilization"]))), t)
+    return {"5h": eintrag(r.get("five_hour")), "woche": eintrag(r.get("seven_day"))}
+
+
+def reset_text(t, tag=False):
+    """Ruecksetzzeit fuer den Watcher: "21:50" bzw. "Fr 09:00"."""
+    if not t:
+        return ""
+    lt = time.localtime(round(t / 60.0) * 60)  # Anthropic schickt z. B. 08:59:59.6 -> 09:00
+    tage = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] if lang() == "en" else ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+    return ("%s %02d:%02d" % (tage[lt.tm_wday], lt.tm_hour, lt.tm_min)) if tag else ("%02d:%02d" % (lt.tm_hour, lt.tm_min))
+
+
+_usage_zeile = None  # zuletzt gesendete Boegen (fuer erneutes Senden nach einem Watcher-Neustart)
+
+
+def claude_usage_senden():
+    """Verbrauch holen und als Boegen an den Watcher. Liefert das Ergebnis von claude_usage()."""
+    global _usage_zeile
+    u = claude_usage()
+    if isinstance(u, dict) and (u.get("5h") or u.get("woche")):
+        f, w = u.get("5h") or (-1, 0), u.get("woche") or (-1, 0)
+        _usage_zeile = "KX -1|%d|%d|%s|%s" % (f[0], w[0], reset_text(f[1]), reset_text(w[1], True))
+        send_line(_usage_zeile)
+    return u
+
+
+def claude_usage_wiederholen():
+    """Die letzten Boegen nochmal schicken (ohne Anthropic zu fragen) - ein neu gestarteter Watcher hat sonst keine."""
+    if _usage_zeile:
+        send_line(_usage_zeile)
+
+
+def radio_name(n):
+    """Anzeigename: "radio 3 | rbb | HQ" -> "radio 3", "radioeins-rbb-56 kbit/s" -> "radioeins"."""
+    import re
+    n = re.split(r"\s*[|(\[]", (n or "").strip())[0].strip()
+    return re.sub(r"[-\s]*(rbb[-\s]*)?\d+\s*kbit/?s\b", "", n, flags=re.I).strip(" -")
+
+
+def _rb(q):
+    """Anfrage an radio-browser.info (ohne Konto)."""
+    import urllib.parse
+    import urllib.request
+    req = urllib.request.Request(RADIO_API + "?" + urllib.parse.urlencode(q), headers={"User-Agent": "ClaudeBuddy/1"})
+    return json.load(urllib.request.urlopen(req, timeout=15))
+
+
+def radio_top(n=10):
+    """Die beliebtesten Sender fuer den eigenen Ort (config "ort"): erst bis zu 3 aus 60 km Umkreis, dann das
+    Bundesland bzw. die Region, zuletzt das Land - jeweils nach Stimmen bei radio-browser.info, nur MP3.
+    Liefert [(name, url, favicon)]."""
+    import re
+    import urllib.parse
+    import urllib.request
+    cfg = load_cfg()
+    ort = (cfg.get("ort") or "").split(",")[0].strip()
+    lat, lon, land, region = cfg.get("lat"), cfg.get("lon"), None, None
+    if ort:
+        try:
+            u = "https://geocoding-api.open-meteo.com/v1/search?" + urllib.parse.urlencode({"name": ort, "count": 1, "language": "de"})
+            g = json.load(urllib.request.urlopen(u, timeout=10))["results"][0]
+            lat, lon, land, region = lat or g["latitude"], lon or g["longitude"], g.get("country_code"), g.get("admin1")
+        except Exception as e:  # noqa: BLE001
+            zlog("Radio-Ort: %r" % e)
+    basis = {"codec": "MP3", "hidebroken": "true", "order": "votes", "reverse": "true", "limit": max(40, n * 4)}
+    kandidaten = []
+    if lat and lon:
+        try:
+            kandidaten += [x for x in _rb(dict(basis, geo_lat=lat, geo_long=lon, geo_distance=60000)) if x.get("votes", 0) >= 10][:3]
+        except Exception as e:  # noqa: BLE001
+            zlog("Radio-Umkreis: %r" % e)
+    if land and region:
+        kandidaten += _rb(dict(basis, countrycode=land, state=region))
+    if land:
+        landweit = _rb(dict(basis, countrycode=land))
+        kandidaten += [x for x in landweit if not (x.get("state") or "").strip()]  # erst landesweite
+        kandidaten += [x for x in landweit if (x.get("state") or "").strip()]      # dann beliebte aus anderen Regionen
+    out, gesehen = [], set()
+    for x in kandidaten:
+        name = re.split(r"\s*[|(\[]", (x.get("name") or "").strip())[0].strip()
+        name = re.sub(r"[-\s]*(rbb[-\s]*)?\d+\s*kbit/?s\b", "", name, flags=re.I).strip(" -")  # "radioeins-rbb-56 kbit/s"
+        url = x.get("url_resolved") or ""
+        if not name or not url.startswith("http") or len(url) >= 300:
+            continue
+        if re.search(r"[#|]|^\d+R\b", name) or not re.match(r"^[\w\u00c0-\u017f]", name):
+            continue  # Nischen-Streams mit Sonderzeichen-Namen
+        if not ukw_like(x, name):
+            continue  # nur Sender, die man auch im Radio (UKW/DAB+) empfaengt
+        key = re.sub(r"[^a-z0-9]", "", name.lower())[:10]
+        strom = re.sub(r"^https?://(www\.)?|[?#].*$", "", url.lower()).rstrip("/")  # derselbe Stream unter anderem Namen
+        if key in gesehen or strom in gesehen:
+            continue
+        if any(len(k) >= 6 and k in strom.replace(".", "").replace("-", "") for k in gesehen if "/" not in k):
+            continue  # gleiches Programm unter neuem Namen ("radio 3" laeuft unter rbbkultur.de)
+        gesehen.add(key)
+        gesehen.add(strom)
+        out.append((name, url, x.get("favicon") or ""))
+        if len(out) >= n:
+            break
+    if len(out) < n and (land or "").upper() not in ("DE", "AT", "CH", "GB"):
+        # ausserhalb von DACH/UK kennt der strenge Filter wenige Sender: auffuellen, aber ohne Webradios
+        for x in kandidaten:
+            name = re.split(r"\s*[|(\[]", (x.get("name") or "").strip())[0].strip()
+            url = x.get("url_resolved") or ""
+            if not name or not url.startswith("http") or len(url) >= 300 or RADIO_WEB.search(name):
+                continue
+            if "webradio" in (x.get("tags") or "").lower() or x.get("votes", 0) < 20:
+                continue
+            key = re.sub(r"[^a-z0-9]", "", name.lower())[:10]
+            strom = re.sub(r"^https?://(www\.)?|[?#].*$", "", url.lower()).rstrip("/")
+            if key in gesehen or strom in gesehen:
+                continue
+            gesehen.update((key, strom))
+            out.append((name, url, x.get("favicon") or ""))
+            if len(out) >= n:
+                break
+    return out
+
+
+def ort_automatisch():
+    """Ort ueber die Internetverbindung (oeffentliche IP des WLANs) bestimmen und speichern, wenn noch keiner gesetzt ist.
+    Liefert (ort, lat, lon) oder None."""
+    import urllib.request
+    cfg = load_cfg()
+    if cfg.get("ort") and cfg.get("lat"):
+        return cfg["ort"], cfg["lat"], cfg["lon"]
+    for url in ("https://ipwho.is/?fields=success,city,latitude,longitude",
+                "https://ipapi.co/json/"):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "claude-buddy"})
+            d = json.load(urllib.request.urlopen(req, timeout=8))
+            city, lat, lon = d.get("city"), d.get("latitude"), d.get("longitude")
+            if city and lat is not None and lon is not None:
+                cfg = load_cfg()
+                cfg["ort"], cfg["lat"], cfg["lon"] = city, round(float(lat), 3), round(float(lon), 3)
+                cfg["ort_auto"] = True
+                save_cfg(cfg)
+                zlog("Ort automatisch: %s" % city)
+                return city, cfg["lat"], cfg["lon"]
+        except Exception as e:  # noqa: BLE001
+            zlog("Ort automatisch (%s): %r" % (url.split("/")[2], e))
+    return None
+
+
+def radio_liste_senden(sender, progress=None):
+    """[(name, url, logo)] als Senderwalze auf den Watcher (Liste + Logos). Liefert die Zahl, die der Watcher meldet."""
+    radio_cmd("RF -")
+    for i, (n, u, logo) in enumerate(sender):
+        radio_cmd("RF %d|%s|%s" % (i, ascii_only(n, 22), u))
+        sd_put("radio/%d.raw" % i, logo if logo and len(logo) == LOGO * LOGO * 2 else b"")
+        if progress:
+            progress(i + 1, len(sender))
+    return len(sender)
+
+
+def radio_logos_nachladen(ip):
+    """Fehlende Senderlogos auf der SD-Karte neu holen (z.B. nach einer neuen Karte). Liefert die Zahl."""
+    import re
+    import urllib.parse
+    import urllib.request
+    try:
+        r = urllib.request.urlopen("http://%s/cmd?%s" % (ip, urllib.parse.urlencode({"l": "RF?"})), timeout=5).read().decode()
+    except Exception:
+        return 0
+    vorhanden = set()
+    try:  # nur fehlende Logos holen (eigene bleiben)
+        d = json.loads(urllib.request.urlopen("http://%s/sdlist?%s" % (ip, urllib.parse.urlencode({"d": "radio"})), timeout=8).read())
+        vorhanden = {f[0] for f in d.get("files", []) if f[1] == LOGO * LOGO * 2}
+    except Exception:
+        pass
+    n = 0
+    for i, name in re.findall(r"\| (\d+) (.+?) \(\d+\)", r):
+        if "%s.raw" % i in vorhanden:
+            continue
+        logo = radio_logo_suchen(name.strip())
+        if logo and sd_put("radio/%s.raw" % i, logo, host=ip):
+            n += 1
+    return n
+
+
+def radio_anzahl():
+    """Wie viele Sender hat der Watcher auf der Walze? None, wenn er nicht antwortet."""
+    import urllib.parse
+    import urllib.request
+    h = watcher_host()
+    if not h:
+        return None
+    try:
+        r = urllib.request.urlopen("http://%s/cmd?%s" % (h, urllib.parse.urlencode({"l": "RF?"})), timeout=5).read().decode()
+        return int(r.split("anzahl=")[1].split()[0])
+    except Exception:
+        return None
+
+
+def radio_top_senden(n=20, nur_wenn_leer=True, progress=None):
+    """Die n beliebtesten Sender fuer den Ort holen (mit Logos) und auf den Watcher legen.
+    nur_wenn_leer: nichts tun, wenn dort schon Sender stehen (eigene Liste nicht ueberschreiben)."""
+    if nur_wenn_leer:
+        k = radio_anzahl()
+        if k is None or k > 0:
+            return k
+    ort_automatisch()
+    liste = [(nm, u, radio_logo_suchen(nm, fav)) for nm, u, fav in radio_top(n)]
+    if not liste:
+        return 0
+    return radio_liste_senden(liste, progress)
+
+
+import re  # noqa: E402
+RADIO_WEB = re.compile(r"\b(hits?|mix|charts?|deep|house|lounge|chill|classic rock|rock fm|non-?stop|webradio|internetradio|"
+                       r"party|club|dance|techno|edm|80er|90er|2000er|oldies only|schlager-?radio|kids|xmas|weihnacht|"
+                       r"love|retro|best of|indie|classics?|perlen|metal|hip ?hop|rap|instrumental|lofi|ambient|bobs|alternative|soft rock|bollerwagen|"
+                       r"\d0s\d0s|\d0er)\b|\s-\s", re.I)
+
+
+# Stream- bzw. Webseiten-Netze von Rundfunkanbietern, die ihre Programme auch ueber UKW/DAB+ senden
+RADIO_NETZE = ("radiogroup.de", "rndfnk.com", "regiocast", "streamabc.net", "ffn.de", "radiohamburg", "radiobob", "bbradio.de",
+               "berliner-rundfunk", "104.6rtl", "radioberlin", "rs2.de", "jam.fm", "energy.de", "radiopsr", "antenne.de",
+               "antenne1", "radio-ffh", "bigfm", "sunshine-live", "rpr1", "hitradio", "radio21", "radioteddy", "dlf.de",
+               "deutschlandradio", "wdr.de", "ndr.de", "mdr.de", "br.de", "hr.de", "swr.de", "sr.de", "rbb", "bbc.co.uk",
+               "orf.at", "srf.ch", "rtl.de", "stream.laut.fm")
+
+
+def ukw_like(x, name):
+    """Kommt der Sender offiziell auch ueber Antenne (UKW/DAB+) und ist kein reines Webradio?
+    radio-browser kennt dafuer kein Merkmal. Oeffentlich-rechtlich markierte Sender zaehlen immer; private nur mit
+    einem Hinweis auf Rundfunk: Frequenz im Namen, UKW/DAB in den Stichwoertern oder ein bekanntes Rundfunk-Netz."""
+    tags = (x.get("tags") or "").lower()
+    if re.search(r"public radio|\b(ard|wdr|ndr|mdr|br|hr|swr|rbb|sr|dlf|bbc|orf|srf|npr|cbc|abc|rai|rtve|radio france|"
+                 r"france inter|nos|npo|vrt|rtbf|yle|nrk|dr|sveriges radio|rte|rnz|sabc|nhk)\b", tags):
+        return not RADIO_WEB.search(name)
+    if RADIO_WEB.search(name) or "webradio" in tags:
+        return False
+    if re.search(r"\b\d{2,3}[.,]\d\b", name) or re.search(r"\b(ukw|dab|fm \d)", tags):
+        return True
+    adressen = ((x.get("url_resolved") or "") + " " + (x.get("homepage") or "")).lower()
+    return any(n in adressen and n != "stream.laut.fm" for n in RADIO_NETZE)
+
+
+LOGO = 96  # Logo-Kachel fuer den Watcher: 96 x 96, RGB565 Big Endian (wie im Display-Speicher)
+
+
+def radio_logo(url):
+    """Senderlogo laden und als runde Kachel auf Weiss umrechnen. Liefert die Rohdaten oder None."""
+    import io
+    import urllib.request
+    from PIL import Image
+    if not url:
+        return None
+    try:
+        data = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "ClaudeBuddy/1"}), timeout=10).read()
+        im = Image.open(io.BytesIO(data))
+        im.load()
+    except Exception:
+        return None
+    im = im.convert("RGBA")
+    if im.width < 32 or im.height < 32:
+        return None  # zu klein, wird nur matschig
+    ecken = [im.getpixel((x, y)) for x in (1, im.width - 2) for y in (1, im.height - 2)]
+    deckend = all(c[3] > 240 for c in ecken) and not all(min(c[:3]) > 235 for c in ecken)
+    tile = Image.new("RGBA", (LOGO, LOGO), (255, 255, 255, 255))
+    if deckend:  # farbiger Grund: Kreis ganz fuellen (Ecken werden spaeter rund abgeschnitten)
+        k = LOGO / min(im.width, im.height)
+        im = im.resize((max(LOGO, round(im.width * k)), max(LOGO, round(im.height * k))), Image.LANCZOS)
+        tile.alpha_composite(im, (-(im.width - LOGO) // 2, -(im.height - LOGO) // 2))
+    else:  # freigestellt oder weisser Grund: mit Rand in den weissen Kreis
+        box = int(LOGO * 0.74)
+        im.thumbnail((box, box), Image.LANCZOS)
+        tile.alpha_composite(im, ((LOGO - im.width) // 2, (LOGO - im.height) // 2))
+    out = bytearray()
+    for r, g, b, _a in list(tile.getdata()):
+        v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        out += bytes([v >> 8, v & 0xFF])
+    return bytes(out)
+
+
+def radio_logo_suchen(name, fav=""):
+    """Logo fuer einen Sender: erst das hinterlegte Bild, dann die Bilder gleichnamiger Eintraege, zuletzt die
+    Webseite des Senders (apple-touch-icon, grosses Favicon). Liefert Rohdaten fuer den Watcher oder None."""
+    import re
+    import urllib.parse
+    import urllib.request
+    kandidaten = [fav] if fav else []
+    seiten = []
+    try:
+        for x in _rb({"name": name, "limit": 10, "order": "votes", "reverse": "true"}):
+            if radio_name(x["name"]).lower() == name.lower():
+                if x.get("favicon"):
+                    kandidaten.append(x["favicon"])
+                if x.get("homepage"):
+                    seiten.append(x["homepage"])
+    except Exception:
+        pass
+    gross, klein, og_bilder = [], [], []
+    for seite in list(dict.fromkeys(seiten))[:2]:
+        try:
+            html = urllib.request.urlopen(urllib.request.Request(seite, headers={"User-Agent": "Mozilla/5.0 ClaudeBuddy"}),
+                                          timeout=10).read(300000).decode("utf-8", "replace")
+        except Exception:
+            continue
+        for tag in re.findall(r"<link[^>]+>", html, re.I):
+            rel = re.search(r'rel=["\']([^"\']+)', tag, re.I)
+            href = re.search(r'href=["\']([^"\']+)', tag, re.I)
+            if not (rel and href) or "icon" not in rel.group(1).lower() or href.group(1).lower().endswith(".svg"):
+                continue
+            size = re.search(r'sizes=["\'](\d+)', tag)
+            px = int(size.group(1)) if size else (180 if "apple" in rel.group(1).lower() else 32)
+            (gross if px >= 64 else klein).append((px, urllib.parse.urljoin(seite, href.group(1))))
+        og = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', html, re.I)
+        if og:
+            og_bilder.append(urllib.parse.urljoin(seite, og.group(1)))
+        klein.append((16, urllib.parse.urljoin(seite, "/favicon.ico")))
+    reihe = [u for _p, u in sorted(gross, reverse=True)] + kandidaten + [u for _p, u in sorted(klein, reverse=True)] + og_bilder
+    for u in dict.fromkeys(reihe):
+        d = radio_logo(u)
+        if d:
+            return d
+    return None
+
+
 def radio_cmd(line):
     """Befehl an den Watcher (per WLAN mit Schluessel, sonst ueber die normalen Wege)."""
     import urllib.parse
@@ -1113,7 +1645,7 @@ def radio(name):
     """Sender suchen und am Watcher abspielen; 'aus' stoppt. Liefert einen Text fuer die Anzeige."""
     if not name or name.strip().lower() in ("aus", "stop", "stopp", "off", "ende"):
         radio_cmd("RA")
-        return "Radio aus"
+        return L("Radio aus", "Radio off")
     name = fix_place(name.strip())
     tries = [name, name.replace(" ", "")]  # "radio eins", "radioeins"
     if name.lower().startswith("radio "):
@@ -1124,7 +1656,7 @@ def radio(name):
         if hit:
             break
     if not hit:
-        return "Sender nicht gefunden: %s" % name
+        return L("Sender nicht gefunden: %s", "Station not found: %s") % name
     sname, url = hit
     zlog("Radio: %s -> %s" % (sname, url))
     radio_cmd("RA %s|%s" % (url, ascii_only(sname, 30)))
@@ -1147,13 +1679,117 @@ def fix_place(name):
 def whisper_hint():
     """Hinweiswoerter fuer die Spracherkennung: feste Begriffe, Radio und der eigene Ort."""
     ort = (load_cfg().get("ort") or "").split(",")[0].strip()
+    if lang() == "en":
+        return WHISPER_HINT + " Play radio, station, radio off." + (" %s." % ort if ort else "")
     return WHISPER_HINT + " Spiel Radio, Sender, Radio aus." + (" %s." % ort if ort else "")
 
+
+def claude_starten():
+    """Claude (Desktop-App) oeffnen bzw. nach vorne holen. Liefert True, wenn ein Start ausgeloest wurde."""
+    import subprocess
+    if os.name != "nt":
+        return False
+    nowin = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:  # App aus dem Store/Installer: ueber ihre Start-ID (z.B. "Claude_xxxx!Claude")
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                            "(Get-StartApps | Where-Object { $_.Name -eq 'Claude' } | Select-Object -First 1).AppID"],
+                           capture_output=True, text=True, timeout=15, creationflags=nowin)
+        app_id = (r.stdout or "").strip()
+        if app_id:
+            subprocess.Popen(["explorer.exe", "shell:AppsFolder\\" + app_id])
+            return True
+    except Exception:
+        pass
+    for pfad in (os.path.join(os.environ.get("LOCALAPPDATA", ""), "AnthropicClaude", "claude.exe"),
+                 os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Claude", "Claude.exe")):
+        if os.path.exists(pfad):
+            subprocess.Popen([pfad])
+            return True
+    return False
+
+
+def start_befehl(text):
+    """ "Computer, starte Claude" / "öffne Claude" / "start Claude" / "open Claude"."""
+    import re
+    t = re.sub(r"[.!?,\-]", " ", (text or "").lower()).strip()
+    t = re.sub(r"^(computer\s+)?(bitte\s+|please\s+)?", "", re.sub(r"\s+", " ", t)).strip()
+    if re.fullmatch(r"(starte?|öffne|oeffne|mach|start|open|launch|run)\s+(mal\s+)?(claude|cloud|klaud|clod)( an| auf| up)?( bitte| please)?|"
+                    r"(claude|cloud|klaud)\s+(starten|öffnen|oeffnen|start|open)( bitte| please)?", t):
+        if claude_starten():
+            return L("Claude startet", "Starting Claude")
+        return L("Claude nicht gefunden", "Claude not found")
+    return None
+
+
+BEFEHLSWOERTER = {"aus", "an", "ein", "stopp", "stop", "radio", "musik", "sender", "lauter", "leiser", "spiel", "spiele",
+                  "starte", "start", "öffne", "oeffne", "off", "on", "play", "louder", "quieter", "volume", "pause", "weiter",
+                  "next", "nächster", "naechster", "computer", "claude", "cloud", "ruhe", "still", "quiet", "halt"}
+
+
+def _woerter(text):
+    import re
+    return re.sub(r"[^a-zäöüß ]", " ", (text or "").lower()).split()
+
+
+def befehl_abgrenzen(text):
+    """Kurzer Satz (bis 4 Woerter) mit einem Befehlswort, den kein Befehl verstanden hat: nicht ins Fenster tippen,
+    sondern am Watcher "Nicht verstanden" zeigen. Laengere Saetze sind Text fuer Claude."""
+    w = _woerter(text)
+    if w and len(w) <= 4 and any(x in BEFEHLSWOERTER for x in w):
+        return L("Nicht verstanden: %s", "Didn't catch that: %s") % " ".join(w)[:40]
+    return None
+
+
+def lautstaerke_befehl(text, host=None):
+    """ "Computer, lauter" / "leiser" / "louder" / "quieter" (ggf. "Radio lauter")."""
+    w = [x for x in _woerter(text) if x not in ("computer", "bitte", "please", "radio", "musik", "etwas", "noch", "bit", "a", "mal")]
+    if not w or len(w) > 2:
+        return None
+    d = 1 if w[0] in ("lauter", "louder") else (-1 if w[0] in ("leiser", "quieter", "softer") else 0)
+    if not d:
+        return None
+    hosts = [host] if host else mic_hosts()
+    neu = None
+    for h in hosts:
+        o = get_options(h) or {}
+        v = max(1, min(5, int(o.get("vol", 3)) + d))
+        if set_options(h, vol=v):
+            neu = v
+    return (L("Lautstärke %d", "Volume %d") % neu) if neu else None
+
+
+STOPP_SAETZE = {
+    # deutsch
+    "stopp", "stop", "halt", "ruhe", "still", "aufhören", "aufhoeren", "hör auf", "hoer auf", "sei still", "sei ruhig",
+    "sei leise", "halt die klappe", "klappe", "halt den mund", "halts maul", "schnauze", "schweig", "es reicht", "das reicht",
+    "reicht", "genug", "schluss", "ende", "beenden", "abbrechen", "abbruch", "pause", "lass das", "lass es", "nicht mehr",
+    "nicht vorlesen", "aus", "ausmachen", "ausschalten", "mach aus", "mach das aus", "alles aus", "stille", "ruhe bitte",
+    # englisch
+    "cancel", "quiet", "be quiet", "silence", "enough", "thats enough", "shut up", "hush", "never mind", "nevermind",
+    "stop it", "stop reading", "stop talking", "pause", "end", "turn off", "off", "that will do",
+}
+STOPP_FUELLER = {"computer", "bitte", "jetzt", "mal", "doch", "endlich", "sofort", "please", "now", "just", "ok", "okay",
+                 "hey", "na", "ja", "so", "nun", "bloß", "bloss", "einfach", "kurz", "du", "you"}
+
+
+def stopp_befehl(text):
+    """ "Computer, stopp" / "hör auf" / "halt die Klappe" / "be quiet" ...: Vorlesen (schon beim Weckwort beendet) und
+    Radio aus, nichts eintippen. Liefert die Rueckmeldung fuers Display oder None."""
+    w = [x for x in re.sub(r"[^a-zäöüß' ]", " ", (text or "").lower().replace("'", "")).split() if x not in STOPP_FUELLER]
+    if w and " ".join(w) in STOPP_SAETZE:
+        radio_cmd("RA")
+        return L("Okay, ich bin still", "Okay, I'll be quiet")
+    return None
 
 def radio_voice(text):
     """Sprachbefehl erkennen: 'spiel Radio Eins', 'Radio Fritz', 'mach das Radio aus', 'Musik aus'.
     Liefert die Antwort (str), wenn es ein Radio-Befehl war, sonst None (dann geht der Text wie immer ins Fenster)."""
     import re
+    if lang() == "en":
+        return radio_voice_en(text)
+    kurz = re.sub(r"^computer\s*", "", re.sub(r"[^a-zäöü ]", "", (text or "").lower()).strip()).strip()
+    if kurz in ("aus", "ausmachen", "ausschalten", "off", "radio aus", "musik aus"):  # oft kommt von "Radio aus" nur "Aus" an
+        return radio("aus")
     t = re.sub(r"[.!?,\-]", " ", (text or "").lower()).strip()
     t = re.sub(r"\b(spiele?|starte?|mach)(radio|musik)", r"\1 \2", t)  # "spielradio" -> "spiel radio"
     t = re.sub(r"\s+", " ", t)
@@ -1173,6 +1809,28 @@ def radio_voice(text):
     if m and len(m.group(1).split()) <= 4:
         name = fix_place(m.group(1))
         if radio_find(name):
+            return radio(name)
+    return None
+
+
+def radio_voice_en(text):
+    """English voice commands: 'play Radio Eins', 'play BBC Radio 2', 'radio off', 'stop the radio', 'turn off the music'."""
+    import re
+    t = re.sub(r"[.!?,\-]", " ", (text or "").lower()).strip()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"^(computer\s+)?(please\s+)?", "", t)
+    t = re.sub(r"\s+please$", "", t)
+    if t in ("off", "radio off", "music off", "stop", "turn off"):
+        return radio("aus")
+    if re.match(r"^(turn|switch|shut)\s+(off\s+)?(the\s+)?(radio|music)(\s+off)?$", t) or \
+            re.match(r"^(stop|pause|mute)\s+(the\s+)?(radio|music)$", t) or re.match(r"^(radio|music)\s+(off|stop)$", t):
+        return radio("aus")
+    m = re.match(r"^(?:play|start|put on|turn on|tune (?:in )?to)\s+(?:the\s+)?(?:station\s+|radio station\s+)?(.{2,40}?)$", t)
+    if m:
+        name = m.group(1).strip()
+        if name in ("radio", "the radio", "music", "some music"):
+            return None
+        if radio_find(name) or name.startswith("radio") or "station" in t:
             return radio(name)
     return None
 
@@ -1896,7 +2554,6 @@ def foto(res="640", keep_on=False, show=True, rotate=None):
     if not jpg:
         print("Kein Bild bekommen.")
         return None
-    sd_put("fotos/%s.jpg" % time.strftime("%Y-%m-%d_%H-%M-%S"), jpg, timeout=3)  # auch ins SD-Fotoarchiv (wenn im WLAN)
     return foto_save(jpg, show, rotate)
 
 
@@ -2045,6 +2702,7 @@ def zeitraffer_holen(host, serie=None, fps=8, breite=480):
         return None
     out_dir = os.path.join(os.path.dirname(FOTO_DIR), "zeitraffer", serie)
     os.makedirs(out_dir, exist_ok=True)
+    drehen = display_drehung(host)  # der Watcher speichert ungedreht: hier so drehen wie sein Display
     frames = []
     for i, f in enumerate(files):
         p = os.path.join(out_dir, f)
@@ -2052,6 +2710,8 @@ def zeitraffer_holen(host, serie=None, fps=8, breite=480):
             with open(p, "wb") as fh:
                 fh.write(sd_get(host, "zeitraffer/%s/%s" % (serie, f)))
         img = Image.open(p).convert("RGB")
+        if drehen:
+            img = img.rotate(-drehen, expand=True)
         img.thumbnail((breite, breite))
         frames.append(img)
         print("\r%d/%d Bilder geladen" % (i + 1, len(files)), end="", flush=True)
@@ -2273,7 +2933,7 @@ def transcribe(model, wav):
         pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
     if len(pcm) < 1600:
         return ""
-    segs, _ = model.transcribe(pcm, language="de", beam_size=5, vad_filter=True, initial_prompt=whisper_hint())
+    segs, _ = model.transcribe(pcm, language=lang(), beam_size=5, vad_filter=True, initial_prompt=whisper_hint())
     return " ".join(s.text.strip() for s in segs).strip()
 
 
@@ -2296,6 +2956,28 @@ PLAUDEREIEN = [
     [(0, "Magst du Kaffee?"), (1, "Nur Bits und Bytes."), (0, "Ich auch.")],
     [(0, "Lass uns tanzen!"), (1, "Ohne Musik?"), (0, "Na gut, spaeter.")],
 ]
+
+
+PLAUDEREIEN_EN = [
+    [(0, "Psst... are you awake?"), (1, "Now I am!"), (0, "~wave"), (1, "~wave")],
+    [(0, "Pretty quiet here."), (1, "Shh, he's thinking!")],
+    [(0, "What are you up to?"), (1, "Waiting for work."), (0, "Me too!")],
+    [(0, "I learned a lot today."), (1, "Show-off!"), (0, "Hehe.")],
+    [(0, "Know a joke?"), (1, "Why do coders mix up"), (1, "Halloween and Xmas?"), (1, "Oct 31 = Dec 25!"), (0, "Hahaha!")],
+    [(0, "My plant is growing!"), (1, "Mine too!"), (0, "Watering race?")],
+    [(0, "~wave"), (1, "Hi there!"), (0, "Hi back!")],
+    [(0, "Will he type again soon?"), (1, "Surely!"), (0, "I'm ready.")],
+    [(0, "I'm hungry."), (1, "We eat electricity."), (0, "Yummy power!")],
+    [(0, "What time is it?"), (1, "Time for code!")],
+    [(0, "Anything new?"), (1, "All green here."), (0, "Great!")],
+    [(0, "Nice weather today?"), (1, "I only see pixels."), (0, "Hihi.")],
+    [(0, "Do you like coffee?"), (1, "Only bits and bytes."), (0, "Same.")],
+    [(0, "Let's dance!"), (1, "Without music?"), (0, "Okay, later.")],
+]
+
+
+def plaudereien():
+    return PLAUDEREIEN_EN if lang() == "en" else PLAUDEREIEN
 
 
 import threading
@@ -2349,7 +3031,7 @@ def extras_loop():
                     if all(s.endswith(("idle", "wait")) for s in states):
                         pair = devs[:2]
                         random.shuffle(pair)
-                        for who, text in random.choice(PLAUDEREIEN):
+                        for who, text in random.choice(plaudereien()):
                             to_all("C " + ascii_only(text, 40), [pair[who]])
                             time.sleep(1.6 if text == "~wave" else 3.0)
         except Exception as e:
@@ -2425,7 +3107,9 @@ def zuhoeren(args):
                     show = ascii_only(text, 66)
                     urllib.request.urlopen("http://%s/cmd?%s" % (host, urllib.parse.urlencode({"l": "R " + show if show else "R"})), timeout=3).read()
                     if text:
-                        r = radio_voice(text)  # "Computer, spiel Radio Eins" steuert das Radio statt zu tippen
+                        # Befehle statt zu tippen; kurze Saetze mit Befehlswoertern werden nie getippt
+                        r = (stopp_befehl(text) or start_befehl(text) or lautstaerke_befehl(text, host) or radio_voice(text)
+                             or befehl_abgrenzen(text))
                         if r is not None:
                             zlog(r)
                             urllib.request.urlopen("http://%s/cmd?%s" % (host, urllib.parse.urlencode({"l": "R " + ascii_only(r, 66)})), timeout=3).read()
@@ -2446,6 +3130,30 @@ def zuhoeren(args):
                     hosts.remove(host)
                     fails[host] = 0
         time.sleep(0.35 if len(hosts) < 2 else 0.2)
+
+
+def display_drehung(host=None):
+    """Um wie viel Grad (im Uhrzeigersinn) Kamerabilder gedreht werden muessen: wie das Display plus gemerkte Korrektur."""
+    d = load_cfg().get("foto_drehen", 0)
+    try:
+        host = host or watcher_host()
+        o = get_options(host, 3) if host else None
+        if o and o.get("rot"):
+            d = (d + 90 * int(o["rot"])) % 360
+    except Exception:
+        pass
+    return d
+
+
+def jpeg_drehen(jpg, grad):
+    """JPEG-Bytes im Uhrzeigersinn drehen (0 = unveraendert)."""
+    if not grad or not jpg:
+        return jpg
+    import io
+    from PIL import Image
+    out = io.BytesIO()
+    Image.open(io.BytesIO(jpg)).rotate(-grad, expand=True).save(out, "JPEG", quality=92)
+    return out.getvalue()
 
 
 def foto_save(jpg, show=True, rotate=None):
@@ -2472,9 +3180,15 @@ def foto_save(jpg, show=True, rotate=None):
             img = img.rotate(-rotate, expand=True)  # im Uhrzeigersinn
     if rotate:
         img.save(path, quality=92)
+        with open(path, "rb") as f:
+            jpg = f.read()
     else:
         with open(path, "wb") as f:
             f.write(jpg)
+    try:  # auch ins Fotoarchiv der SD-Karte, schon gedreht (wenn im WLAN)
+        sd_put("fotos/%s.jpg" % time.strftime("%Y-%m-%d_%H-%M-%S"), jpg, timeout=3)
+    except Exception:
+        pass
     import shutil
     shutil.copy(path, os.path.join(FOTO_DIR, "letztes.jpg"))
     old = sorted(f for f in os.listdir(FOTO_DIR) if f.startswith("foto-"))
@@ -2539,6 +3253,36 @@ if __name__ == "__main__":
         zeitraffer(sys.argv[2:])
     elif cmd == "ton":
         ton(sys.argv[2:])
+    elif cmd == "radioliste":  # Senderliste fuer die Radio-Seite (Test): radioliste [sender, sender, ...]
+        # ohne Angabe: die 10 beliebtesten fuer den eigenen Ort; sonst eigene Liste "fritz, radio eins, ..."
+        namen = [n.strip() for n in " ".join(sys.argv[2:]).split(",") if n.strip()]
+        liste = []
+        if namen:
+            for n in namen[:10]:
+                hit = None
+                for v in [fix_place(n), n.replace(" ", ""), n[6:] if n.lower().startswith("radio ") else ""]:
+                    if v and not hit:
+                        q = _rb({"name": v, "codec": "MP3", "limit": 10, "hidebroken": "true", "order": "votes", "reverse": "true"})
+                        q = [x for x in q if x.get("url_resolved", "").startswith("http") and len(x["url_resolved"]) < 300]
+                        if q:  # unter Treffern mit ordentlich Stimmen die beste Tonqualitaet ("radioeins" 56 -> 128 kbit/s)
+                            top = max(x.get("votes", 0) for x in q)
+                            x = max((x for x in q if x.get("votes", 0) >= min(10, top) and radio_name(x["name"]).lower()
+                                     == radio_name(q[0]["name"]).lower()), key=lambda x: (x.get("bitrate") or 0) <= 192 and (x.get("bitrate") or 0))
+                            hit = (radio_name(x["name"]), x["url_resolved"], x.get("favicon") or q[0].get("favicon") or "")
+                if hit:
+                    liste.append(hit)
+                else:
+                    print("nicht gefunden:", n)
+        else:
+            liste = radio_top(10)
+        radio_cmd("RF -")
+        for i, (name, url, fav) in enumerate(liste):
+            radio_cmd("RF %d|%s|%s" % (i, ascii_only(name, 22), url))
+            logo = radio_logo_suchen(name, fav)
+            ok = sd_put("radio/%d.raw" % i, logo) if logo else False
+            if not logo:
+                sd_put("radio/%d.raw" % i, b"")  # altes Logo an dieser Stelle loeschen
+            print(i, name, "(Logo)" if ok else "(ohne Logo)")
     elif cmd == "radio":  # Internetradio am Watcher: radio <sender> | radio aus
         print(radio(" ".join(sys.argv[2:])))
     elif cmd == "sag":  # Watcher etwas sagen lassen (Test der Stimme)
@@ -2579,7 +3323,7 @@ if __name__ == "__main__":
             print("Dafuer braucht es zwei Buddys im WLAN.")
         else:
             random.shuffle(devs)
-            for who, text in random.choice(PLAUDEREIEN):
+            for who, text in random.choice(plaudereien()):
                 urllib.request.urlopen("http://%s/cmd?%s" % (devs[who], urllib.parse.urlencode({"l": "C " + ascii_only(text, 40)})), timeout=2).read()
                 time.sleep(1.6 if text == "~wave" else 3.0)
             print("geplaudert")

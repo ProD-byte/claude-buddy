@@ -12,8 +12,7 @@ Im Leerlauf spielt er Jo-Jo, liest, gießt seine Pflanze (sie wächst mit jeder 
 
 ## In drei Schritten
 
-1. **Programm** laden: [Windows](https://github.com/ProD-byte/claude-buddy/releases/latest/download/ClaudeBuddySetup.exe)
-   oder Linux (AppImage, siehe Seite oben).
+1. **Programm** laden: [Windows](https://github.com/ProD-byte/claude-buddy/releases/latest/download/ClaudeBuddySetup.exe).
 2. **Watcher** per USB (unterer Anschluss) anstecken: Der Assistent spielt die Firmware auf, bringt ihn ins WLAN,
    koppelt ihn und verbindet Claude Code.
 3. **Claude Code** neu starten – ab dann meldet jede Sitzung dem Buddy, was sie tut.
@@ -29,5 +28,5 @@ und die Sprache Deutsch/Englisch).
 
 ## English
 
-A little companion on the SenseCAP Watcher that shows what Claude Code is doing. Install the app (Windows or Linux),
+A little companion on the SenseCAP Watcher that shows what Claude Code is doing. Install the Windows app,
 plug in the Watcher and follow the wizard. Display language German or English. Over Wi-Fi it updates itself at night.
